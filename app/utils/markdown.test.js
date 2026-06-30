@@ -1,6 +1,11 @@
 import { html, render } from 'lit-html';
 import { describe, expect, test } from 'vitest';
-import { renderMarkdown } from './markdown.js';
+import {
+  clearMarkdownCache,
+  getMarkdownCacheSize,
+  renderMarkdown,
+  renderMarkdownHtml
+} from './markdown.js';
 
 describe('utils/markdown', () => {
   test('renders empty input', () => {
@@ -110,5 +115,15 @@ describe('utils/markdown', () => {
     );
     // DOMPurify removes/neutralizes javascript: links
     expect(hrefs.some((h) => h.startsWith('javascript:'))).toBe(false);
+  });
+
+  test('caches repeated markdown output', () => {
+    clearMarkdownCache();
+
+    const first = renderMarkdownHtml('**cached**');
+    const second = renderMarkdownHtml('**cached**');
+
+    expect(second).toBe(first);
+    expect(getMarkdownCacheSize()).toBe(1);
   });
 });

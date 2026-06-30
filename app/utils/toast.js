@@ -7,7 +7,7 @@
  */
 export function showToast(text, variant = 'info', duration_ms = 2800) {
   const el = document.createElement('div');
-  el.className = 'toast';
+  el.className = `toast toast--${variant}`;
   el.textContent = text;
   el.style.position = 'fixed';
   el.style.right = '12px';
@@ -18,11 +18,11 @@ export function showToast(text, variant = 'info', duration_ms = 2800) {
   el.style.borderRadius = '4px';
   el.style.fontSize = '12px';
   if (variant === 'success') {
-    el.style.background = '#156d36';
+    el.style.background = 'var(--success, #3e8635)';
   } else if (variant === 'error') {
-    el.style.background = '#9f2011';
+    el.style.background = 'var(--danger, #c9190b)';
   } else {
-    el.style.background = 'rgba(0,0,0,0.85)';
+    el.style.background = 'var(--masthead-bg, rgba(0,0,0,0.85))';
   }
   (document.body || document.documentElement).appendChild(el);
   setTimeout(() => {

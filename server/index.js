@@ -51,7 +51,8 @@ const { scheduleListRefresh } = attachWsServer(server, {
   // Coalesce DB change bursts into one refresh run
   refresh_debounce_ms: 75,
   root_dir: config.root_dir,
-  watcher: db_watcher
+  watcher: db_watcher,
+  prewarm_board_cache: true
 });
 
 // Watch the global registry for workspace changes (e.g., when user starts

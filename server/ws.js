@@ -17,6 +17,27 @@ import { validateSubscribeListPayload } from './validators.js';
 const log = debug('ws');
 
 /**
+ * @typedef {{ id: string, updated_at: number, closed_at: number | null } & Record<string, unknown>} SubscriptionIssue
+ * @typedef {Awaited<ReturnType<typeof fetchListForSubscription>>} FetchListResult
+ */
+
+const BOARD_LIST_CLIENT_TYPES = new Map([
+  ['tab:board:ready', 'ready-issues'],
+  ['tab:board:in-progress', 'in-progress-issues'],
+  ['tab:board:closed', 'closed-issues'],
+  ['tab:board:blocked', 'blocked-issues']
+]);
+
+/** @type {Map<string, { items: SubscriptionIssue[] }>} */
+const BOARD_LIST_CACHE = new Map();
+/** @type {Map<string, Promise<FetchListResult>>} */
+const BOARD_LIST_INFLIGHT = new Map();
+/** @type {Promise<void> | null} */
+let BOARD_LIST_PREWARM_PROMISE = null;
+let BOARD_LIST_CACHE_GENERATION = 0;
+let BOARD_LIST_PREWARM_ENABLED = false;
+
+/**
  * Debounced refresh scheduling for active list subscriptions.
  * A trailing window coalesces rapid change bursts into a single refresh run.
  */
@@ -137,6 +158,7 @@ function collectActiveListSpecs() {
  * Run refresh for all active list subscription specs and publish deltas.
  */
 async function refreshAllActiveListSubscriptions() {
+  clearBoardListCache();
   const specs = collectActiveListSpecs();
   // Run refreshes concurrently; locking is handled per key in the registry
   await Promise.all(
@@ -148,6 +170,9 @@ async function refreshAllActiveListSubscriptions() {
       }
     })
   );
+  if (BOARD_LIST_PREWARM_ENABLED) {
+    void scheduleBoardListPrewarm();
+  }
 }
 
 /**
@@ -415,12 +440,161 @@ function applyClosedIssuesFilter(spec, items) {
   return out;
 }
 
+function defaultBoardClosedSince() {
+  const now = new Date();
+  const start = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+    0,
+    0,
+    0,
+    0
+  );
+  return start.getTime();
+}
+
+/**
+ * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
+ */
+function isCacheableBoardListSpec(spec) {
+  const type = String(spec.type || '');
+  if (
+    type === 'ready-issues' ||
+    type === 'in-progress-issues' ||
+    type === 'blocked-issues'
+  ) {
+    return true;
+  }
+  if (type !== 'closed-issues') {
+    return false;
+  }
+  const since = spec.params?.since;
+  return typeof since === 'number' && Number.isFinite(since) && since > 0;
+}
+
+/**
+ * @param {string} client_id
+ * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
+ */
+function isBoardListSubscription(client_id, spec) {
+  const expected_type = BOARD_LIST_CLIENT_TYPES.get(client_id);
+  return (
+    expected_type === String(spec.type || '') && isCacheableBoardListSpec(spec)
+  );
+}
+
+/**
+ * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
+ */
+function boardListCacheKey(spec) {
+  const root_dir = CURRENT_WORKSPACE?.root_dir || '';
+  const db_path = CURRENT_WORKSPACE?.db_path || '';
+  return `${root_dir}\0${db_path}\0${keyOf(spec)}`;
+}
+
+function clearBoardListCache() {
+  BOARD_LIST_CACHE.clear();
+  BOARD_LIST_INFLIGHT.clear();
+  BOARD_LIST_PREWARM_PROMISE = null;
+  BOARD_LIST_CACHE_GENERATION += 1;
+}
+
+/**
+ * @param {FetchListResult} res
+ * @returns {FetchListResult}
+ */
+function cloneListResult(res) {
+  if (!res.ok) {
+    return res;
+  }
+  return { ok: true, items: res.items.slice() };
+}
+
+/**
+ * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
+ * @returns {Promise<FetchListResult>}
+ */
+async function fetchCachedBoardListSubscription(spec) {
+  const cache_key = boardListCacheKey(spec);
+  const cached = BOARD_LIST_CACHE.get(cache_key);
+  if (cached) {
+    return { ok: true, items: cached.items.slice() };
+  }
+  const inflight = BOARD_LIST_INFLIGHT.get(cache_key);
+  if (inflight) {
+    return cloneListResult(await inflight);
+  }
+
+  const generation = BOARD_LIST_CACHE_GENERATION;
+  const pending = fetchListForSubscription(spec, {
+    cwd: CURRENT_WORKSPACE?.root_dir
+  }).then((res) => {
+    if (!res.ok) {
+      return res;
+    }
+    const items = applyClosedIssuesFilter(spec, res.items).slice();
+    if (generation === BOARD_LIST_CACHE_GENERATION) {
+      BOARD_LIST_CACHE.set(cache_key, { items });
+    }
+    return /** @type {FetchListResult} */ ({ ok: true, items });
+  });
+  BOARD_LIST_INFLIGHT.set(cache_key, pending);
+  try {
+    return cloneListResult(await pending);
+  } finally {
+    if (BOARD_LIST_INFLIGHT.get(cache_key) === pending) {
+      BOARD_LIST_INFLIGHT.delete(cache_key);
+    }
+  }
+}
+
+/**
+ * @param {string} client_id
+ * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
+ * @returns {Promise<FetchListResult>}
+ */
+async function fetchInitialListForSubscription(client_id, spec) {
+  if (isBoardListSubscription(client_id, spec)) {
+    return fetchCachedBoardListSubscription(spec);
+  }
+  return fetchListForSubscription(spec, {
+    cwd: CURRENT_WORKSPACE?.root_dir
+  });
+}
+
+async function prewarmBoardListCache() {
+  await Promise.all([
+    fetchCachedBoardListSubscription({ type: 'ready-issues' }),
+    fetchCachedBoardListSubscription({ type: 'in-progress-issues' }),
+    fetchCachedBoardListSubscription({
+      type: 'closed-issues',
+      params: { since: defaultBoardClosedSince() }
+    }),
+    fetchCachedBoardListSubscription({ type: 'blocked-issues' })
+  ]);
+}
+
+function scheduleBoardListPrewarm() {
+  if (BOARD_LIST_PREWARM_PROMISE) {
+    return BOARD_LIST_PREWARM_PROMISE;
+  }
+  BOARD_LIST_PREWARM_PROMISE = prewarmBoardListCache()
+    .catch((err) => {
+      log('board list prewarm failed: %o', err);
+    })
+    .finally(() => {
+      BOARD_LIST_PREWARM_PROMISE = null;
+    });
+  return BOARD_LIST_PREWARM_PROMISE;
+}
+
 /**
  * Attach a WebSocket server to an existing HTTP server.
  *
  * @param {Server} http_server
- * @param {{ path?: string, heartbeat_ms?: number, refresh_debounce_ms?: number, root_dir?: string, watcher?: { rebind: (opts?: { root_dir?: string }) => void, path: string } }} [options]
- * @returns {{ wss: WebSocketServer, broadcast: (type: MessageType, payload?: unknown) => void, scheduleListRefresh: () => void, setWorkspace: (root_dir: string) => { changed: boolean, workspace: { root_dir: string, db_path: string } } }}
+ * @param {{ path?: string, heartbeat_ms?: number, refresh_debounce_ms?: number, root_dir?: string, watcher?: { rebind: (opts?: { root_dir?: string }) => void, path: string }, prewarm_board_cache?: boolean }} [options]
+ * @returns {{ wss: WebSocketServer, broadcast: (type: MessageType, payload?: unknown) => void, scheduleListRefresh: () => void, prewarmBoardCache: () => Promise<void>, setWorkspace: (root_dir: string) => { changed: boolean, workspace: { root_dir: string, db_path: string } } }}
  */
 export function attachWsServer(http_server, options = {}) {
   const ws_path = options.path || '/ws';
@@ -432,6 +606,8 @@ export function attachWsServer(http_server, options = {}) {
     root_dir: initial_root,
     db_path: initial_db.path
   };
+  clearBoardListCache();
+  BOARD_LIST_PREWARM_ENABLED = options.prewarm_board_cache === true;
 
   if (options.watcher) {
     DB_WATCHER = options.watcher;
@@ -493,6 +669,13 @@ export function attachWsServer(http_server, options = {}) {
     clearInterval(interval);
   });
 
+  if (BOARD_LIST_PREWARM_ENABLED) {
+    const prewarm_timer = setTimeout(() => {
+      void scheduleBoardListPrewarm();
+    }, 0);
+    prewarm_timer.unref?.();
+  }
+
   /**
    * Broadcast a server-initiated event to all open clients.
    *
@@ -541,6 +724,7 @@ export function attachWsServer(http_server, options = {}) {
 
       // Clear existing registry entries and refresh all subscriptions
       registry.clear();
+      clearBoardListCache();
 
       // Broadcast workspace-changed event to all clients
       broadcast('workspace-changed', CURRENT_WORKSPACE);
@@ -556,6 +740,7 @@ export function attachWsServer(http_server, options = {}) {
     wss,
     broadcast,
     scheduleListRefresh,
+    prewarmBoardCache: scheduleBoardListPrewarm,
     setWorkspace
     // v2: list subscription refresh handles updates
   };
@@ -632,12 +817,10 @@ export async function handleMessage(ws, data) {
       ws.send(JSON.stringify(makeError(req, code, message, details)));
     };
 
-    /** @type {Awaited<ReturnType<typeof fetchListForSubscription>> | null} */
-    let initial = null;
+    /** @type {FetchListResult} */
+    let initial;
     try {
-      initial = await fetchListForSubscription(spec, {
-        cwd: CURRENT_WORKSPACE?.root_dir
-      });
+      initial = await fetchInitialListForSubscription(client_id, spec);
     } catch (err) {
       log('subscribe-list snapshot error for %s: %o', key, err);
       const message =
@@ -1322,6 +1505,7 @@ export async function handleMessage(ws, data) {
 
       // Clear existing registry entries
       registry.clear();
+      clearBoardListCache();
 
       // Schedule refresh of all active list subscriptions
       scheduleListRefresh();

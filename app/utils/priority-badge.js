@@ -15,7 +15,7 @@ export function createPriorityBadge(priority) {
   const label = labelForPriority(p);
   el.setAttribute('title', label);
   el.setAttribute('aria-label', `Priority: ${label}`);
-  el.textContent = emojiForPriority(p) + ' ' + label;
+  el.textContent = priorityPrefix(p) + ' ' + label;
   return el;
 }
 
@@ -31,18 +31,25 @@ function labelForPriority(p) {
  * @param {number} p
  */
 export function emojiForPriority(p) {
+  return priorityPrefix(p);
+}
+
+/**
+ * @param {number} p
+ */
+function priorityPrefix(p) {
   switch (p) {
     case 0:
-      return '🔥';
+      return 'P0';
     case 1:
-      return '⚡️';
+      return 'P1';
     case 2:
-      return '🔧';
+      return 'P2';
     case 3:
-      return '🪶';
+      return 'P3';
     case 4:
-      return '💤';
+      return 'P4';
     default:
-      return '🔧';
+      return 'P2';
   }
 }

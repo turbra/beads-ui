@@ -5,6 +5,14 @@ import { debug } from '../utils/logging.js';
 import { cmpPriorityThenCreated } from './sort.js';
 
 /**
+ * @param {object} obj
+ * @param {string} key
+ */
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+/**
  * Per-subscription issue store. Holds full Issue objects and exposes a
  * deterministic, read-only snapshot for rendering. Applies snapshot/upsert/
  * delete messages in revision order and preserves object identity per id.
@@ -47,6 +55,25 @@ export function createSubscriptionIssueStore(id, options = {}) {
   }
 
   /**
+   * Preserve enrichment that list/detail snapshots may omit, without allowing a
+   * seeded issue to block the server's next real revision.
+   *
+   * @param {any} next
+   * @param {any} existing
+   */
+  function preserveKnownFields(next, existing) {
+    if (!existing || !next) {
+      return;
+    }
+    if (!hasOwn(next, 'comment_count') && hasOwn(existing, 'comment_count')) {
+      next.comment_count = existing.comment_count;
+    }
+    if (!hasOwn(next, 'comments') && hasOwn(existing, 'comments')) {
+      next.comments = existing.comments;
+    }
+  }
+
+  /**
    * Apply snapshot/upsert/delete in revision order. Snapshots reset state.
    * - Ignore messages with revision <= last_revision (except snapshot which resets first).
    * - Preserve object identity when updating an existing item by mutating
@@ -71,10 +98,12 @@ export function createSubscriptionIssueStore(id, options = {}) {
       if (rev <= last_revision) {
         return; // ignore stale snapshot
       }
+      const previous_items = new Map(items_by_id);
       items_by_id.clear();
       const items = Array.isArray(msg.issues) ? msg.issues : [];
       for (const it of items) {
         if (it && typeof it.id === 'string' && it.id.length > 0) {
+          preserveKnownFields(it, previous_items.get(it.id));
           items_by_id.set(it.id, it);
         }
       }
@@ -98,6 +127,12 @@ export function createSubscriptionIssueStore(id, options = {}) {
             ? /** @type {number} */ (it.updated_at)
             : 0;
           if (prev_ts <= next_ts) {
+            const has_incoming_comments = hasOwn(it, 'comments');
+            const preserve_comments =
+              !has_incoming_comments && hasOwn(existing, 'comments');
+            const previous_comments = preserve_comments
+              ? existing.comments
+              : undefined;
             // Mutate existing object to preserve reference
             for (const k of Object.keys(existing)) {
               if (!(k in it)) {
@@ -108,6 +143,9 @@ export function createSubscriptionIssueStore(id, options = {}) {
             for (const [k, v] of Object.entries(it)) {
               // @ts-ignore - dynamic assignment
               existing[k] = v;
+            }
+            if (preserve_comments) {
+              existing.comments = previous_comments;
             }
           } else {
             // stale by timestamp; ignore
@@ -128,6 +166,43 @@ export function createSubscriptionIssueStore(id, options = {}) {
     }
   }
 
+  /**
+   * Seed a store from already-loaded list data before the server snapshot
+   * arrives. This does not advance `last_revision`, so the real snapshot still
+   * replaces or enriches the seeded issue.
+   *
+   * @param {any[]} items
+   */
+  function seed(items) {
+    if (is_disposed || !Array.isArray(items)) {
+      return;
+    }
+    let changed = false;
+    for (const it of items) {
+      if (!it || typeof it.id !== 'string' || it.id.length === 0) {
+        continue;
+      }
+      const existing = items_by_id.get(it.id);
+      if (existing) {
+        const prev_ts = Number.isFinite(existing.updated_at)
+          ? /** @type {number} */ (existing.updated_at)
+          : 0;
+        const next_ts = Number.isFinite(it.updated_at)
+          ? /** @type {number} */ (it.updated_at)
+          : 0;
+        if (next_ts < prev_ts) {
+          continue;
+        }
+      }
+      items_by_id.set(it.id, { ...it });
+      changed = true;
+    }
+    if (changed) {
+      rebuildOrdered();
+      emit();
+    }
+  }
+
   return {
     id,
     /**
@@ -140,6 +215,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
       };
     },
     applyPush,
+    seed,
     snapshot() {
       // Return as read-only view; callers must not mutate
       return ordered;

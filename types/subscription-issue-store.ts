@@ -35,6 +35,12 @@ export interface SubscriptionIssueStore {
    */
   applyPush(msg: SnapshotMsg | UpsertMsg | DeleteMsg): void;
 
+  /**
+   * Seed with already-loaded list data without advancing the server revision.
+   * The next real snapshot may still replace or enrich the seeded issue.
+   */
+  seed(items: Issue[]): void;
+
   /** Stable, read-only snapshot of issues for rendering. */
   snapshot(): readonly Issue[];
 

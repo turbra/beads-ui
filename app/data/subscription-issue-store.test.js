@@ -66,6 +66,148 @@ describe('subscription issue store', () => {
     expect(after).toBe(before); // identity preserved
   });
 
+  test('preserves comments when upsert omits comments', () => {
+    const store = createSubscriptionIssueStore('s1');
+    const comments = [{ id: 1, text: 'Existing comment' }];
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 1,
+      issues: [
+        {
+          id: 'X',
+          title: 'x',
+          comments,
+          comment_count: 1,
+          created_at: 10_000,
+          updated_at: 10_000,
+          closed_at: null
+        }
+      ]
+    });
+
+    store.applyPush({
+      type: 'upsert',
+      id: 's1',
+      revision: 2,
+      issue: {
+        id: 'X',
+        title: 'X!',
+        comment_count: 1,
+        created_at: 10_000,
+        updated_at: 10_060,
+        closed_at: null
+      }
+    });
+
+    expect(store.getById('X')?.comments).toBe(comments);
+    expect(store.getById('X')?.title).toBe('X!');
+  });
+
+  test('accepts explicit incoming comments on upsert', () => {
+    const store = createSubscriptionIssueStore('s1');
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 1,
+      issues: [
+        {
+          id: 'X',
+          title: 'x',
+          comments: [{ id: 1, text: 'Existing comment' }],
+          comment_count: 1,
+          created_at: 10_000,
+          updated_at: 10_000,
+          closed_at: null
+        }
+      ]
+    });
+
+    store.applyPush({
+      type: 'upsert',
+      id: 's1',
+      revision: 2,
+      issue: {
+        id: 'X',
+        title: 'X!',
+        comments: [],
+        comment_count: 0,
+        created_at: 10_000,
+        updated_at: 10_060,
+        closed_at: null
+      }
+    });
+
+    expect(store.getById('X')?.comments).toEqual([]);
+    expect(store.getById('X')?.comment_count).toBe(0);
+  });
+
+  test('seed does not advance revision before server snapshot', () => {
+    const store = createSubscriptionIssueStore('s1');
+
+    store.seed([
+      {
+        id: 'X',
+        title: 'Seeded title',
+        created_at: 10_000,
+        updated_at: 10_000,
+        closed_at: null
+      }
+    ]);
+
+    expect(store.getById('X')?.title).toBe('Seeded title');
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 1,
+      issues: [
+        {
+          id: 'X',
+          title: 'Server title',
+          created_at: 10_000,
+          updated_at: 10_060,
+          closed_at: null
+        }
+      ]
+    });
+
+    expect(store.getById('X')?.title).toBe('Server title');
+  });
+
+  test('preserves comments metadata when snapshot omits it', () => {
+    const store = createSubscriptionIssueStore('s1');
+    const comments = [{ id: 1, text: 'Existing comment' }];
+
+    store.seed([
+      {
+        id: 'X',
+        title: 'Seeded title',
+        comments,
+        comment_count: 1,
+        created_at: 10_000,
+        updated_at: 10_000,
+        closed_at: null
+      }
+    ]);
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 1,
+      issues: [
+        {
+          id: 'X',
+          title: 'Server title',
+          created_at: 10_000,
+          updated_at: 10_060,
+          closed_at: null
+        }
+      ]
+    });
+
+    expect(store.getById('X')?.comment_count).toBe(1);
+    expect(store.getById('X')?.comments).toBe(comments);
+  });
+
   test('ignores stale upsert by revision and timestamp', () => {
     const store = createSubscriptionIssueStore('s1');
     store.applyPush({

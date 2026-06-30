@@ -57,6 +57,27 @@ describe('list adapters for subscription types', () => {
     ]);
   });
 
+  test('mapSubscriptionToBdArgs filters closed-issues by since param', () => {
+    const since = Date.parse('2026-06-30T04:00:00.000Z');
+
+    const args = mapSubscriptionToBdArgs({
+      type: 'closed-issues',
+      params: { since }
+    });
+
+    expect(args).toEqual([
+      'list',
+      '--json',
+      '--tree=false',
+      '--status',
+      'closed',
+      '--limit',
+      '1000',
+      '--closed-after',
+      '2026-06-30T04:00:00.000Z'
+    ]);
+  });
+
   test('mapSubscriptionToBdArgs returns args for issue-detail', () => {
     const args = mapSubscriptionToBdArgs({
       type: 'issue-detail',

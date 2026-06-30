@@ -526,6 +526,7 @@ export function bootstrap(root_element) {
         // ignore
       }
     });
+    const detail_panel = /** @type {HTMLElement} */ (detail_mount);
 
     /** @type {ReturnType<typeof createDetailView> | null} */
     let detail = null;
@@ -546,77 +547,142 @@ export function bootstrap(root_element) {
       sub_issue_stores
     );
 
-    // If router already set a selected id (deep-link), open dialog now
-    const initial_id = store.getState().selected_id;
-    if (initial_id) {
-      detail_mount.hidden = false;
-      dialog.open(initial_id);
-      if (detail) {
-        void detail.load(initial_id);
+    /** @type {null | (() => Promise<void>)} */
+    let unsub_detail = null;
+    /** @type {string | null} */
+    let active_detail_id = null;
+    const DETAIL_SEED_CLIENT_IDS = Object.freeze([
+      'tab:issues',
+      'tab:epics',
+      'tab:board:ready',
+      'tab:board:in-progress',
+      'tab:board:closed',
+      'tab:board:blocked'
+    ]);
+
+    /**
+     * @param {string} detail_id
+     */
+    function findIssueForDetailSeed(detail_id) {
+      for (const client_id of DETAIL_SEED_CLIENT_IDS) {
+        const issues = sub_issue_stores.snapshotFor(client_id);
+        const found = issues.find((issue) => String(issue.id) === detail_id);
+        if (found) {
+          return found;
+        }
       }
-      // Ensure detail subscription is active on initial deep-link
-      const client_id = `detail:${initial_id}`;
-      const spec = { type: 'issue-detail', params: { id: initial_id } };
-      // Register store first to avoid dropping the initial snapshot
+      return null;
+    }
+
+    /**
+     * @param {string} client_id
+     * @param {string} detail_id
+     */
+    function seedDetailStore(client_id, detail_id) {
+      const source_issue = findIssueForDetailSeed(detail_id);
+      if (!source_issue) {
+        return;
+      }
+      const detail_store = sub_issue_stores.getStore(client_id);
+      if (detail_store && typeof detail_store.seed === 'function') {
+        detail_store.seed([source_issue]);
+      }
+    }
+
+    /**
+     * @param {string} id
+     */
+    function openDetail(id) {
+      const detail_id = String(id);
+      if (active_detail_id === detail_id) {
+        return;
+      }
+      const previous_id = active_detail_id;
+      const previous_unsub = unsub_detail;
+      active_detail_id = detail_id;
+      unsub_detail = null;
+      detail_panel.hidden = false;
+      dialog.open(detail_id);
+      if (previous_unsub) {
+        void previous_unsub().catch(() => {});
+      }
+      if (previous_id) {
+        try {
+          sub_issue_stores.unregister(`detail:${previous_id}`);
+        } catch {
+          // ignore stale detail store cleanup errors
+        }
+      }
+      const client_id = `detail:${detail_id}`;
+      const spec = { type: 'issue-detail', params: { id: detail_id } };
       try {
         sub_issue_stores.register(client_id, spec);
+        seedDetailStore(client_id, detail_id);
       } catch (err) {
         log('register detail store failed: %o', err);
       }
-      void subscriptions.subscribeList(client_id, spec).catch((err) => {
-        log('detail subscribe failed: %o', err);
-        showFatalFromError(err, 'issue details');
-      });
+      if (detail) {
+        void detail.load(detail_id);
+      }
+      void subscriptions
+        .subscribeList(client_id, spec)
+        .then((unsub) => {
+          if (active_detail_id !== detail_id) {
+            void unsub().catch(() => {});
+            return;
+          }
+          unsub_detail = unsub;
+        })
+        .catch((err) => {
+          log('detail subscribe failed: %o', err);
+          showFatalFromError(err, 'issue details');
+        });
+    }
+
+    /**
+     * Close the active detail dialog and clean up its subscription.
+     */
+    function closeDetail() {
+      if (!active_detail_id && detail_panel.hidden) {
+        return;
+      }
+      const previous_id = active_detail_id;
+      active_detail_id = null;
+      try {
+        dialog.close();
+      } catch {
+        // ignore
+      }
+      if (detail) {
+        detail.clear();
+      }
+      detail_panel.hidden = true;
+      if (unsub_detail) {
+        void unsub_detail().catch(() => {});
+        unsub_detail = null;
+      }
+      if (previous_id) {
+        try {
+          sub_issue_stores.unregister(`detail:${previous_id}`);
+        } catch {
+          // ignore stale detail store cleanup errors
+        }
+      }
+    }
+
+    // If router already set a selected id (deep-link), open dialog now
+    const initial_id = store.getState().selected_id;
+    if (initial_id) {
+      openDetail(initial_id);
     }
 
     // Open/close dialog based on selected_id (always dialog; no page variant)
-    /** @type {null | (() => Promise<void>)} */
-    let unsub_detail = null;
     store.subscribe((s) => {
       const id = s.selected_id;
       if (id) {
-        detail_mount.hidden = false;
-        dialog.open(id);
-        if (detail) {
-          void detail.load(id);
-        }
-        // Wire per-issue subscription for detail
-        const client_id = `detail:${id}`;
-        const spec = { type: 'issue-detail', params: { id } };
-        // Ensure per-subscription issue store exists before subscribing
-        try {
-          sub_issue_stores.register(client_id, spec);
-        } catch {
-          // ignore
-        }
-        // Subscribe server-side
-        void subscriptions
-          .subscribeList(client_id, spec)
-          .then((unsub) => {
-            // Unsubscribe previous if any
-            if (unsub_detail) {
-              void unsub_detail().catch(() => {});
-            }
-            unsub_detail = unsub;
-          })
-          .catch((err) => {
-            log('detail subscribe failed: %o', err);
-            showFatalFromError(err, 'issue details');
-          });
+        openDetail(id);
       } else {
-        try {
-          dialog.close();
-        } catch {
-          // ignore
-        }
-        if (detail) {
-          detail.clear();
-        }
-        detail_mount.hidden = true;
-        if (unsub_detail) {
-          void unsub_detail().catch(() => {});
-          unsub_detail = null;
-        }
+        closeDetail();
       }
     });
 
@@ -692,12 +758,50 @@ export function bootstrap(root_element) {
       return { type: 'all-issues' };
     }
 
+    /**
+     * @param {{ closed_filter?: string }} board
+     */
+    function computeBoardClosedSince(board) {
+      const mode = String(board?.closed_filter || 'today');
+      const now = new Date();
+      const start = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate(),
+        0,
+        0,
+        0,
+        0
+      );
+      const day_start = start.getTime();
+      if (mode === '3') {
+        return day_start - 3 * 24 * 60 * 60 * 1000;
+      }
+      if (mode === '7') {
+        return day_start - 7 * 24 * 60 * 60 * 1000;
+      }
+      return day_start;
+    }
+
+    /**
+     * @param {{ closed_filter?: string }} board
+     * @returns {{ type: string, params: { since: number } }}
+     */
+    function computeBoardClosedSpec(board) {
+      return {
+        type: 'closed-issues',
+        params: { since: computeBoardClosedSince(board) }
+      };
+    }
+
     /** @type {string|null} */
     let last_issues_spec_key = null;
+    /** @type {string|null} */
+    let last_board_closed_spec_key = null;
     /**
      * Ensure only the active tab has subscriptions; clean up previous.
      *
-     * @param {{ view: 'issues'|'epics'|'board', filters: any }} s
+     * @param {{ view: 'issues'|'epics'|'board', filters: any, board?: any }} s
      */
     function ensureTabSubscriptions(s) {
       // Issues tab
@@ -829,27 +933,43 @@ export function bootstrap(root_element) {
             });
         }
         // Closed column
+        const closed_spec = computeBoardClosedSpec(s.board || {});
+        const closed_key = JSON.stringify(closed_spec);
+        const closed_sub_key = `tab:board:closed:${closed_key}`;
         if (
-          !unsub_board_closed &&
-          !pending_subscriptions.has('tab:board:closed')
+          (!unsub_board_closed || closed_key !== last_board_closed_spec_key) &&
+          !pending_subscriptions.has(closed_sub_key)
         ) {
           try {
-            sub_issue_stores.register('tab:board:closed', {
-              type: 'closed-issues'
-            });
+            sub_issue_stores.register('tab:board:closed', closed_spec);
           } catch (err) {
             log('register board:closed store failed: %o', err);
           }
-          pending_subscriptions.add('tab:board:closed');
-          void subscriptions
-            .subscribeList('tab:board:closed', { type: 'closed-issues' })
-            .then((u) => (unsub_board_closed = u))
+          const previous_unsub =
+            unsub_board_closed && closed_key !== last_board_closed_spec_key
+              ? unsub_board_closed
+              : null;
+          if (previous_unsub) {
+            unsub_board_closed = null;
+          }
+          pending_subscriptions.add(closed_sub_key);
+          const ready_to_subscribe = previous_unsub
+            ? previous_unsub().catch(() => {})
+            : Promise.resolve();
+          void ready_to_subscribe
+            .then(() =>
+              subscriptions.subscribeList('tab:board:closed', closed_spec)
+            )
+            .then((u) => {
+              unsub_board_closed = u;
+              last_board_closed_spec_key = closed_key;
+            })
             .catch((err) => {
               log('subscribe board closed failed: %o', err);
               showFatalFromError(err, 'board (Closed)');
             })
             .finally(() => {
-              pending_subscriptions.delete('tab:board:closed');
+              pending_subscriptions.delete(closed_sub_key);
             });
         }
         // Blocked column
@@ -899,6 +1019,7 @@ export function bootstrap(root_element) {
         if (unsub_board_closed) {
           void unsub_board_closed().catch(() => {});
           unsub_board_closed = null;
+          last_board_closed_spec_key = null;
           try {
             sub_issue_stores.unregister('tab:board:closed');
           } catch (err) {

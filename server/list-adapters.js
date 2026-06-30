@@ -29,7 +29,7 @@ export function mapSubscriptionToBdArgs(spec) {
       return ['list', '--json', '--tree=false', '--status', 'in_progress'];
     }
     case 'closed-issues': {
-      return [
+      const args = [
         'list',
         '--json',
         '--tree=false',
@@ -38,6 +38,12 @@ export function mapSubscriptionToBdArgs(spec) {
         '--limit',
         '1000'
       ];
+      const since =
+        typeof spec.params?.since === 'number' ? spec.params.since : 0;
+      if (Number.isFinite(since) && since > 0) {
+        args.push('--closed-after', new Date(since).toISOString());
+      }
+      return args;
     }
     case 'issue-detail': {
       const p = spec.params || {};
