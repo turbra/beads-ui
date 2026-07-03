@@ -115,6 +115,7 @@ describe('detail view via subscription push', () => {
       status: 'open',
       priority: 2
     });
+    await tick();
 
     // Expect title to appear in the detail view
     const h2 = mount.querySelector('#detail-root h2');
@@ -265,7 +266,7 @@ describe('detail view via subscription push', () => {
     expect(mount.textContent).toContain('Complete replacement');
   });
 
-  test('retries comments after failed fetch clears in-flight state', async () => {
+  test('shows comment fetch errors and retries on request', async () => {
     let fetch_count = 0;
 
     const { mount, store } = await setupDetail('UI-5', async (type) => {
@@ -282,9 +283,19 @@ describe('detail view via subscription push', () => {
     pushSnapshot(store, 'UI-5');
     await tick();
 
+    expect(fetch_count).toBe(1);
+    expect(mount.textContent).toContain('temporary failure');
+
     pushUpsert(store, 'UI-5', 2, {
       title: 'Retry'
     });
+    await tick();
+    expect(fetch_count).toBe(1);
+
+    const retry = /** @type {HTMLButtonElement | null} */ (
+      mount.querySelector('.comments button')
+    );
+    retry?.click();
     await tick();
 
     expect(fetch_count).toBe(2);

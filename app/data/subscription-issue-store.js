@@ -37,10 +37,16 @@ export function createSubscriptionIssueStore(id, options = {}) {
   const listeners = new Set();
   /** @type {boolean} */
   let is_disposed = false;
+  /** @type {boolean} */
+  let emit_scheduled = false;
   /** @type {(a:any,b:any)=>number} */
   const sort = options.sort || cmpPriorityThenCreated;
 
-  function emit() {
+  function flushEmit() {
+    emit_scheduled = false;
+    if (is_disposed) {
+      return;
+    }
     for (const fn of Array.from(listeners)) {
       try {
         fn();
@@ -48,6 +54,14 @@ export function createSubscriptionIssueStore(id, options = {}) {
         // ignore listener errors
       }
     }
+  }
+
+  function scheduleEmit() {
+    if (is_disposed || emit_scheduled) {
+      return;
+    }
+    emit_scheduled = true;
+    queueMicrotask(flushEmit);
   }
 
   function rebuildOrdered() {
@@ -109,7 +123,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
       }
       rebuildOrdered();
       last_revision = rev;
-      emit();
+      scheduleEmit();
       return;
     }
     if (msg.type === 'upsert') {
@@ -154,7 +168,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
         rebuildOrdered();
       }
       last_revision = rev;
-      emit();
+      scheduleEmit();
     } else if (msg.type === 'delete') {
       const rid = String(msg.issue_id || '');
       if (rid) {
@@ -162,7 +176,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
         rebuildOrdered();
       }
       last_revision = rev;
-      emit();
+      scheduleEmit();
     }
   }
 
@@ -199,7 +213,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
     }
     if (changed) {
       rebuildOrdered();
-      emit();
+      scheduleEmit();
     }
   }
 
@@ -231,6 +245,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
     },
     dispose() {
       is_disposed = true;
+      emit_scheduled = false;
       items_by_id.clear();
       ordered = [];
       listeners.clear();

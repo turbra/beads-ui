@@ -419,6 +419,15 @@ export function bootstrap(root_element) {
       view: last_view,
       board: persistedBoard
     });
+    let persisted_filters_json = JSON.stringify({
+      status: persisted_filters.status,
+      search: persisted_filters.search,
+      type: persisted_filters.type
+    });
+    let persisted_board_json = JSON.stringify({
+      closed_filter: persistedBoard.closed_filter
+    });
+    let persisted_view_value = last_view;
     const router = createHashRouter(store);
     router.start();
     /**
@@ -502,14 +511,21 @@ export function bootstrap(root_element) {
         search: s.filters.search,
         type: typeof s.filters.type === 'string' ? s.filters.type : ''
       };
-      window.localStorage.setItem('beads-ui.filters', JSON.stringify(data));
+      const next_json = JSON.stringify(data);
+      if (next_json !== persisted_filters_json) {
+        window.localStorage.setItem('beads-ui.filters', next_json);
+        persisted_filters_json = next_json;
+      }
     });
     // Persist board preferences
     store.subscribe((s) => {
-      window.localStorage.setItem(
-        'beads-ui.board',
-        JSON.stringify({ closed_filter: s.board.closed_filter })
-      );
+      const next_json = JSON.stringify({
+        closed_filter: s.board.closed_filter
+      });
+      if (next_json !== persisted_board_json) {
+        window.localStorage.setItem('beads-ui.board', next_json);
+        persisted_board_json = next_json;
+      }
     });
     void issues_view.load();
 
@@ -528,12 +544,26 @@ export function bootstrap(root_element) {
     });
     const detail_panel = /** @type {HTMLElement} */ (detail_mount);
 
+    /**
+     * Detail transport: comments load in the background, so keep them off the
+     * global activity indicator that tracked sends drive.
+     *
+     * @param {string} type
+     * @param {unknown} payload
+     */
+    const detail_transport = async (type, payload) => {
+      if (type === 'get-comments') {
+        return client.send(/** @type {MessageType} */ (type), payload);
+      }
+      return transport(type, payload);
+    };
+
     /** @type {ReturnType<typeof createDetailView> | null} */
     let detail = null;
     // Mount details into the dialog body only
     detail = createDetailView(
       dialog.getMount(),
-      transport,
+      detail_transport,
       (hash) => {
         const id = parseHash(hash);
         if (id) {
@@ -1060,7 +1090,10 @@ export function bootstrap(root_element) {
       if (!s.selected_id && s.view === 'board') {
         void board_view.load();
       }
-      window.localStorage.setItem('beads-ui.view', s.view);
+      if (s.view !== persisted_view_value) {
+        window.localStorage.setItem('beads-ui.view', s.view);
+        persisted_view_value = s.view;
+      }
     };
     store.subscribe(onRouteChange);
     // Ensure initial state is reflected (fixes reload on #/epics)

@@ -1,14 +1,37 @@
-import { beforeEach, describe, expect, test, vi } from 'vitest';
-import { runBd, runBdJson } from './bd.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import { getGitUserName, runBd, runBdJson } from './bd.js';
 import { handleMessage } from './ws.js';
 
-vi.mock('./bd.js', () => ({ runBdJson: vi.fn(), runBd: vi.fn() }));
+vi.mock('./bd.js', () => ({
+  getGitUserName: vi.fn(),
+  runBdJson: vi.fn(),
+  runBd: vi.fn()
+}));
+
+/** @type {string[]} */
+const temp_dirs = [];
 
 // Ensure clean mock state for each test
 beforeEach(() => {
   /** @type {import('vitest').Mock} */ (runBd).mockReset();
   /** @type {import('vitest').Mock} */ (runBdJson).mockReset();
+  /** @type {import('vitest').Mock} */ (getGitUserName).mockReset();
 });
+
+afterEach(() => {
+  for (const dir of temp_dirs.splice(0)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function makeTempWorkspace() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bdui-ws-'));
+  temp_dirs.push(dir);
+  return dir;
+}
 
 function makeStubSocket() {
   return {
@@ -20,6 +43,23 @@ function makeStubSocket() {
       this.sent.push(String(msg));
     }
   };
+}
+
+/**
+ * @param {ReturnType<typeof makeStubSocket>} ws
+ * @param {string} root_dir
+ */
+async function setWorkspace(ws, root_dir) {
+  await handleMessage(
+    /** @type {any} */ (ws),
+    Buffer.from(
+      JSON.stringify({
+        id: `workspace-${path.basename(root_dir)}`,
+        type: /** @type {any} */ ('set-workspace'),
+        payload: { path: root_dir }
+      })
+    )
+  );
 }
 
 describe('ws mutation handlers', () => {
@@ -338,5 +378,66 @@ describe('ws mutation handlers', () => {
     const obj = JSON.parse(ws.sent[ws.sent.length - 1]);
     expect(obj.ok).toBe(true);
     expect(obj.payload && obj.payload.created).toBe(true);
+  });
+
+  test('mutations run bd commands in the selected workspace', async () => {
+    const root_dir = makeTempWorkspace();
+    const mRun = /** @type {import('vitest').Mock} */ (runBd);
+    const mJson = /** @type {import('vitest').Mock} */ (runBdJson);
+    mRun.mockResolvedValue({ code: 0, stdout: '', stderr: '' });
+    mJson.mockResolvedValue({ code: 0, stdoutJson: { id: 'UI-7' } });
+    const ws = makeStubSocket();
+    await setWorkspace(ws, root_dir);
+
+    await handleMessage(
+      /** @type {any} */ (ws),
+      Buffer.from(
+        JSON.stringify({
+          id: 'cwd-status',
+          type: 'update-status',
+          payload: { id: 'UI-7', status: 'closed' }
+        })
+      )
+    );
+
+    expect(mRun).toHaveBeenLastCalledWith(
+      ['update', 'UI-7', '--status', 'closed'],
+      { cwd: root_dir }
+    );
+    expect(mJson).toHaveBeenLastCalledWith(['show', 'UI-7', '--json'], {
+      cwd: root_dir
+    });
+  });
+
+  test('add-comment uses selected workspace for author, mutation, and reload', async () => {
+    const root_dir = makeTempWorkspace();
+    const mRun = /** @type {import('vitest').Mock} */ (runBd);
+    const mJson = /** @type {import('vitest').Mock} */ (runBdJson);
+    const mGit = /** @type {import('vitest').Mock} */ (getGitUserName);
+    mGit.mockResolvedValue('Alice');
+    mRun.mockResolvedValue({ code: 0, stdout: '', stderr: '' });
+    mJson.mockResolvedValue({ code: 0, stdoutJson: [] });
+    const ws = makeStubSocket();
+    await setWorkspace(ws, root_dir);
+
+    await handleMessage(
+      /** @type {any} */ (ws),
+      Buffer.from(
+        JSON.stringify({
+          id: 'cwd-comment',
+          type: /** @type {any} */ ('add-comment'),
+          payload: { id: 'UI-9', text: 'hello' }
+        })
+      )
+    );
+
+    expect(mGit).toHaveBeenCalledWith({ cwd: root_dir });
+    expect(mRun).toHaveBeenLastCalledWith(
+      ['comment', 'UI-9', 'hello', '--author', 'Alice'],
+      { cwd: root_dir }
+    );
+    expect(mJson).toHaveBeenLastCalledWith(['comments', 'UI-9', '--json'], {
+      cwd: root_dir
+    });
   });
 });

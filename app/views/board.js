@@ -1,4 +1,5 @@
 import { html, render } from 'lit-html';
+import { repeat } from 'lit-html/directives/repeat.js';
 import { createListSelectors } from '../data/list-selectors.js';
 import { cmpClosedDesc, cmpPriorityThenCreated } from '../data/sort.js';
 import { createIssueIdRenderer } from '../utils/issue-id-renderer.js';
@@ -31,6 +32,13 @@ const COLUMN_STATUS_MAP = {
   'in-progress-col': 'in_progress',
   'closed-col': 'closed'
 };
+
+const BOARD_CLIENT_IDS = [
+  'tab:board:ready',
+  'tab:board:blocked',
+  'tab:board:in-progress',
+  'tab:board:closed'
+];
 
 /**
  * Create the Board view with Blocked, Ready, In progress, Closed.
@@ -155,7 +163,11 @@ export function createBoardView(
           role="list"
           aria-labelledby=${id + '-header'}
         >
-          ${items.map((it) => cardTemplate(it))}
+          ${repeat(
+            items,
+            (it) => it.id,
+            (it) => cardTemplate(it, title)
+          )}
         </div>
       </section>
     `;
@@ -163,22 +175,23 @@ export function createBoardView(
 
   /**
    * @param {IssueLite} it
+   * @param {string} column_title
    */
-  function cardTemplate(it) {
+  function cardTemplate(it, column_title) {
+    const title = it.title || '(no title)';
     return html`
       <article
         class="board-card"
         data-issue-id=${it.id}
         role="listitem"
         tabindex="-1"
+        aria-label=${`Issue ${title} - Column ${column_title}`}
         draggable="true"
         @click=${(/** @type {MouseEvent} */ ev) => onCardClick(ev, it.id)}
         @dragstart=${(/** @type {DragEvent} */ ev) => onDragStart(ev, it.id)}
         @dragend=${onDragEnd}
       >
-        <div class="board-card__title text-truncate">
-          ${it.title || '(no title)'}
-        </div>
+        <div class="board-card__title text-truncate">${title}</div>
         <div class="board-card__meta">
           ${createTypeBadge(it.issue_type)} ${createPriorityBadge(it.priority)}
           ${createIssueIdRenderer(it.id, { class_name: 'mono' })}
@@ -299,21 +312,7 @@ export function createBoardView(
         }
         /** @type {HTMLElement[]} */
         const cards = Array.from(body.querySelectorAll('.board-card'));
-        // Assign aria-label using column header for screen readers
-        const header = /** @type {HTMLElement|null} */ (
-          col.querySelector('.board-column__header')
-        );
-        const col_name = header ? header.textContent?.trim() || '' : '';
         for (const card of cards) {
-          const title_el = /** @type {HTMLElement|null} */ (
-            card.querySelector('.board-card__title')
-          );
-          const t = title_el ? title_el.textContent?.trim() || '' : '';
-          card.setAttribute(
-            'aria-label',
-            `Issue ${t || '(no title)'} — Column ${col_name}`
-          );
-          // Default roving setup
           card.tabIndex = -1;
         }
         if (cards.length > 0) {
@@ -623,7 +622,7 @@ export function createBoardView(
       } catch {
         // ignore
       }
-    });
+    }, BOARD_CLIENT_IDS);
   }
 
   return {

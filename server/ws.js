@@ -32,9 +32,20 @@ const BOARD_LIST_CLIENT_TYPES = new Map([
 const BOARD_LIST_CACHE = new Map();
 /** @type {Map<string, Promise<FetchListResult>>} */
 const BOARD_LIST_INFLIGHT = new Map();
+/**
+ * Short-lived caches for issue detail snapshots and comments. Entries only
+ * live between database change events: both caches are cleared on
+ * watcher-driven refresh, mutations, and workspace switch.
+ */
+/** @type {Map<string, { items: SubscriptionIssue[] }>} */
+const ISSUE_DETAIL_CACHE = new Map();
+/** @type {Map<string, unknown>} */
+const COMMENTS_CACHE = new Map();
+const DETAIL_CACHE_LIMIT = 500;
 /** @type {Promise<void> | null} */
 let BOARD_LIST_PREWARM_PROMISE = null;
 let BOARD_LIST_CACHE_GENERATION = 0;
+let DETAIL_CACHE_GENERATION = 0;
 let BOARD_LIST_PREWARM_ENABLED = false;
 
 /**
@@ -71,6 +82,9 @@ let MUTATION_GATE = null;
  * @param {number} [timeout_ms]
  */
 function triggerMutationRefreshOnce(timeout_ms = 500) {
+  // Drop cached detail/comments immediately so re-subscribes during the
+  // mutation window never see pre-mutation data.
+  clearDetailCaches();
   if (MUTATION_GATE) {
     return;
   }
@@ -362,14 +376,22 @@ function emitSubscriptionDelete(ws, client_id, key, issue_id) {
 async function refreshAndPublish(spec) {
   const key = keyOf(spec);
   await registry.withKeyLock(key, async () => {
+    const generation = BOARD_LIST_CACHE_GENERATION;
+    // Detail refreshes update an open dialog; keep them ahead of list refreshes
+    const is_detail = String(spec.type) === 'issue-detail';
     const res = await fetchListForSubscription(spec, {
-      cwd: CURRENT_WORKSPACE?.root_dir
+      cwd: CURRENT_WORKSPACE?.root_dir,
+      priority: is_detail ? 'interactive' : 'background'
     });
     if (!res.ok) {
       log('refresh failed for %s: %s %o', key, res.error.message, res.error);
       return;
     }
     const items = applyClosedIssuesFilter(spec, res.items);
+    populateBoardListCache(spec, items, generation);
+    if (is_detail) {
+      populateIssueDetailCache(spec, items, generation);
+    }
     const prev_size = registry.get(key)?.itemsById.size || 0;
     const delta = registry.applyItems(key, items);
     const entry = registry.get(key);
@@ -498,6 +520,115 @@ function clearBoardListCache() {
   BOARD_LIST_INFLIGHT.clear();
   BOARD_LIST_PREWARM_PROMISE = null;
   BOARD_LIST_CACHE_GENERATION += 1;
+  clearDetailCaches();
+}
+
+/**
+ * Clear issue-detail and comments caches. Called whenever the database may
+ * have changed (mutations, watcher-driven refresh, workspace switch).
+ */
+function clearDetailCaches() {
+  ISSUE_DETAIL_CACHE.clear();
+  COMMENTS_CACHE.clear();
+  DETAIL_CACHE_GENERATION += 1;
+}
+
+/**
+ * Options for bd commands that must run in the selected workspace, not
+ * necessarily the daemon process cwd.
+ *
+ * @param {{ priority?: 'interactive' | 'background' }} [options]
+ */
+function selectedWorkspaceBdOptions(options = {}) {
+  return {
+    cwd: CURRENT_WORKSPACE?.root_dir,
+    ...options
+  };
+}
+
+/**
+ * @param {string} issue_id
+ */
+function issueDetailCacheKey(issue_id) {
+  const root_dir = CURRENT_WORKSPACE?.root_dir || '';
+  const db_path = CURRENT_WORKSPACE?.db_path || '';
+  return `${root_dir}\0${db_path}\0${issue_id}`;
+}
+
+/**
+ * @param {Map<string, unknown>} cache
+ * @param {number} limit
+ */
+function evictOldestCacheEntry(cache, limit) {
+  if (cache.size <= limit) {
+    return;
+  }
+  const oldest_key = cache.keys().next().value;
+  if (oldest_key !== undefined) {
+    cache.delete(oldest_key);
+  }
+}
+
+/**
+ * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
+ * @param {SubscriptionIssue[]} items
+ * @param {number} generation
+ */
+function populateIssueDetailCache(spec, items, generation) {
+  if (generation !== DETAIL_CACHE_GENERATION) {
+    return;
+  }
+  const issue_id = String(spec.params?.id || '').trim();
+  if (issue_id.length === 0) {
+    return;
+  }
+  ISSUE_DETAIL_CACHE.set(issueDetailCacheKey(issue_id), {
+    items: items.slice()
+  });
+  evictOldestCacheEntry(ISSUE_DETAIL_CACHE, DETAIL_CACHE_LIMIT);
+}
+
+/**
+ * Serve an issue-detail snapshot from cache when available, fetching and
+ * caching it otherwise.
+ *
+ * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
+ * @returns {Promise<FetchListResult>}
+ */
+async function fetchCachedIssueDetail(spec) {
+  const issue_id = String(spec.params?.id || '').trim();
+  if (issue_id.length === 0) {
+    return fetchListForSubscription(spec, {
+      cwd: CURRENT_WORKSPACE?.root_dir
+    });
+  }
+  const cached = ISSUE_DETAIL_CACHE.get(issueDetailCacheKey(issue_id));
+  if (cached) {
+    return { ok: true, items: cached.items.slice() };
+  }
+  const generation = DETAIL_CACHE_GENERATION;
+  const res = await fetchListForSubscription(spec, {
+    cwd: CURRENT_WORKSPACE?.root_dir
+  });
+  if (res.ok) {
+    populateIssueDetailCache(spec, res.items, generation);
+  }
+  return res;
+}
+
+/**
+ * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
+ * @param {SubscriptionIssue[]} items
+ * @param {number} generation
+ */
+function populateBoardListCache(spec, items, generation) {
+  if (
+    generation !== BOARD_LIST_CACHE_GENERATION ||
+    !isCacheableBoardListSpec(spec)
+  ) {
+    return;
+  }
+  BOARD_LIST_CACHE.set(boardListCacheKey(spec), { items: items.slice() });
 }
 
 /**
@@ -513,9 +644,10 @@ function cloneListResult(res) {
 
 /**
  * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
+ * @param {{ priority?: 'interactive' | 'background' }} [options]
  * @returns {Promise<FetchListResult>}
  */
-async function fetchCachedBoardListSubscription(spec) {
+async function fetchCachedBoardListSubscription(spec, options = {}) {
   const cache_key = boardListCacheKey(spec);
   const cached = BOARD_LIST_CACHE.get(cache_key);
   if (cached) {
@@ -528,15 +660,14 @@ async function fetchCachedBoardListSubscription(spec) {
 
   const generation = BOARD_LIST_CACHE_GENERATION;
   const pending = fetchListForSubscription(spec, {
-    cwd: CURRENT_WORKSPACE?.root_dir
+    cwd: CURRENT_WORKSPACE?.root_dir,
+    priority: options.priority
   }).then((res) => {
     if (!res.ok) {
       return res;
     }
     const items = applyClosedIssuesFilter(spec, res.items).slice();
-    if (generation === BOARD_LIST_CACHE_GENERATION) {
-      BOARD_LIST_CACHE.set(cache_key, { items });
-    }
+    populateBoardListCache(spec, items, generation);
     return /** @type {FetchListResult} */ ({ ok: true, items });
   });
   BOARD_LIST_INFLIGHT.set(cache_key, pending);
@@ -558,20 +689,28 @@ async function fetchInitialListForSubscription(client_id, spec) {
   if (isBoardListSubscription(client_id, spec)) {
     return fetchCachedBoardListSubscription(spec);
   }
+  if (String(spec.type) === 'issue-detail') {
+    return fetchCachedIssueDetail(spec);
+  }
   return fetchListForSubscription(spec, {
     cwd: CURRENT_WORKSPACE?.root_dir
   });
 }
 
 async function prewarmBoardListCache() {
+  /** @type {{ priority: 'background' }} */
+  const opts = { priority: 'background' };
   await Promise.all([
-    fetchCachedBoardListSubscription({ type: 'ready-issues' }),
-    fetchCachedBoardListSubscription({ type: 'in-progress-issues' }),
-    fetchCachedBoardListSubscription({
-      type: 'closed-issues',
-      params: { since: defaultBoardClosedSince() }
-    }),
-    fetchCachedBoardListSubscription({ type: 'blocked-issues' })
+    fetchCachedBoardListSubscription({ type: 'ready-issues' }, opts),
+    fetchCachedBoardListSubscription({ type: 'in-progress-issues' }, opts),
+    fetchCachedBoardListSubscription(
+      {
+        type: 'closed-issues',
+        params: { since: defaultBoardClosedSince() }
+      },
+      opts
+    ),
+    fetchCachedBoardListSubscription({ type: 'blocked-issues' }, opts)
   ]);
 }
 
@@ -932,14 +1071,16 @@ export async function handleMessage(ws, data) {
       return;
     }
     // Pass empty string to clear assignee when requested
-    const res = await runBd(['update', id, '--assignee', assignee]);
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+    const res = await runBd(['update', id, '--assignee', assignee], bd_options);
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], bd_options);
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
@@ -977,14 +1118,16 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['update', id, '--status', status]);
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+    const res = await runBd(['update', id, '--status', status], bd_options);
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], bd_options);
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
@@ -1023,14 +1166,19 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['update', id, '--priority', String(priority)]);
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+    const res = await runBd(
+      ['update', id, '--priority', String(priority)],
+      bd_options
+    );
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], bd_options);
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
@@ -1087,14 +1235,16 @@ export async function handleMessage(ws, data) {
             : field === 'notes'
               ? '--notes'
               : '--design';
-    const res = await runBd(['update', id, flag, value]);
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+    const res = await runBd(['update', id, flag, value], bd_options);
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], bd_options);
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
@@ -1145,7 +1295,9 @@ export async function handleMessage(ws, data) {
     if (typeof description === 'string' && description.length > 0) {
       args.push('-d', description);
     }
-    const res = await runBd(args);
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+    const res = await runBd(args, bd_options);
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
@@ -1183,7 +1335,9 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['dep', 'add', a, b]);
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+    const res = await runBd(['dep', 'add', a, b], bd_options);
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
@@ -1191,7 +1345,7 @@ export async function handleMessage(ws, data) {
       return;
     }
     const id = typeof view_id === 'string' && view_id.length > 0 ? view_id : a;
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], bd_options);
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
@@ -1227,7 +1381,9 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['dep', 'remove', a, b]);
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+    const res = await runBd(['dep', 'remove', a, b], bd_options);
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
@@ -1235,7 +1391,7 @@ export async function handleMessage(ws, data) {
       return;
     }
     const id = typeof view_id === 'string' && view_id.length > 0 ? view_id : a;
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], bd_options);
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
@@ -1271,14 +1427,16 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['label', 'add', id, label.trim()]);
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+    const res = await runBd(['label', 'add', id, label.trim()], bd_options);
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], bd_options);
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
@@ -1314,14 +1472,16 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['label', 'remove', id, label.trim()]);
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+    const res = await runBd(['label', 'remove', id, label.trim()], bd_options);
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json']);
+    const shown = await runBdJson(['show', id, '--json'], bd_options);
     if (shown.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
@@ -1348,14 +1508,29 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBdJson(['comments', id, '--json']);
+    const cache_key = issueDetailCacheKey(id);
+    const cached = COMMENTS_CACHE.get(cache_key);
+    if (cached !== undefined) {
+      ws.send(JSON.stringify(makeOk(req, cached)));
+      return;
+    }
+    const generation = DETAIL_CACHE_GENERATION;
+    const res = await runBdJson(
+      ['comments', id, '--json'],
+      selectedWorkspaceBdOptions()
+    );
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, res.stdoutJson || [])));
+    const comments = Array.isArray(res.stdoutJson) ? res.stdoutJson : [];
+    if (generation === DETAIL_CACHE_GENERATION) {
+      COMMENTS_CACHE.set(cache_key, comments);
+      evictOldestCacheEntry(COMMENTS_CACHE, DETAIL_CACHE_LIMIT);
+    }
+    ws.send(JSON.stringify(makeOk(req, comments)));
     return;
   }
 
@@ -1380,23 +1555,26 @@ export async function handleMessage(ws, data) {
       return;
     }
 
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+
     // Get git user name for author attribution
-    const author = await getGitUserName();
+    const author = await getGitUserName(bd_options);
     const args = ['comment', id, text.trim()];
     if (author) {
       args.push('--author', author);
     }
 
-    const res = await runBd(args);
+    const res = await runBd(args, bd_options);
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-
     // Return updated comments list
-    const comments = await runBdJson(['comments', id, '--json']);
+    const generation = DETAIL_CACHE_GENERATION;
+    const comments = await runBdJson(['comments', id, '--json'], bd_options);
     if (comments.code !== 0) {
       ws.send(
         JSON.stringify(
@@ -1405,7 +1583,14 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    ws.send(JSON.stringify(makeOk(req, comments.stdoutJson || [])));
+    const comment_list = Array.isArray(comments.stdoutJson)
+      ? comments.stdoutJson
+      : [];
+    if (generation === DETAIL_CACHE_GENERATION) {
+      COMMENTS_CACHE.set(issueDetailCacheKey(id), comment_list);
+      evictOldestCacheEntry(COMMENTS_CACHE, DETAIL_CACHE_LIMIT);
+    }
+    ws.send(JSON.stringify(makeOk(req, comment_list)));
     return;
   }
 
@@ -1420,7 +1605,9 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const res = await runBd(['delete', id, '--force']);
+    clearDetailCaches();
+    const bd_options = selectedWorkspaceBdOptions();
+    const res = await runBd(['delete', id, '--force'], bd_options);
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(

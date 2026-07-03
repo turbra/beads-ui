@@ -8,7 +8,7 @@ import { createSubscriptionIssueStore } from './subscription-issue-store.js';
 function createTestIssueStores() {
   /** @type {Map<string, ReturnType<typeof createSubscriptionIssueStore>>} */
   const stores = new Map();
-  /** @type {Set<() => void>} */
+  /** @type {Set<(client_id: string) => void>} */
   const listeners = new Set();
 
   /**
@@ -23,7 +23,7 @@ function createTestIssueStores() {
       s.subscribe(() => {
         for (const fn of Array.from(listeners)) {
           try {
-            fn();
+            fn(id);
           } catch {
             // ignore
           }
@@ -31,6 +31,14 @@ function createTestIssueStores() {
       });
     }
     return s;
+  }
+
+  /**
+   * @param {(client_id: string) => void} fn
+   */
+  function subscribe(fn) {
+    listeners.add(fn);
+    return () => listeners.delete(fn);
   }
 
   return {
@@ -42,13 +50,29 @@ function createTestIssueStores() {
       return getStore(id).snapshot();
     },
     /**
-     * @param {() => void} fn
+     * @param {(client_id: string) => void} fn
      */
-    subscribe(fn) {
-      listeners.add(fn);
-      return () => listeners.delete(fn);
+    subscribe,
+    /**
+     * @param {string | string[]} client_ids
+     * @param {(client_id: string) => void} fn
+     */
+    subscribeFor(client_ids, fn) {
+      const wanted = new Set(
+        (Array.isArray(client_ids) ? client_ids : [client_ids]).map(String)
+      );
+      return subscribe((client_id) => {
+        if (wanted.has(client_id)) {
+          fn(client_id);
+        }
+      });
     }
   };
+}
+
+async function flushMicrotasks() {
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 /**
@@ -209,7 +233,7 @@ describe('list-selectors', () => {
     expect(out).toEqual(['E2', 'E1']);
   });
 
-  test('subscribe triggers once per issues envelope', async () => {
+  test('subscribe triggers once per coalesced issues envelope', async () => {
     const { issueStores, selectors } = setup();
     let calls = 0;
     const off = selectors.subscribe(() => {
@@ -222,6 +246,33 @@ describe('list-selectors', () => {
       revision: 1,
       issues: []
     });
+    await flushMicrotasks();
+
+    expect(calls).toBe(1);
+    off();
+  });
+
+  test('subscribe filters by client id when scoped', async () => {
+    const { issueStores, selectors } = setup();
+    let calls = 0;
+    const off = selectors.subscribe(() => {
+      calls += 1;
+    }, 'tab:issues');
+
+    issueStores.getStore('detail:A').applyPush({
+      type: 'snapshot',
+      id: 'detail:A',
+      revision: 1,
+      issues: []
+    });
+    issueStores.getStore('tab:issues').applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 1,
+      issues: []
+    });
+    await flushMicrotasks();
+
     expect(calls).toBe(1);
     off();
   });

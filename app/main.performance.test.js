@@ -192,4 +192,25 @@ describe('main performance-sensitive subscriptions', () => {
       )
     ).toBe(true);
   });
+
+  test('does not persist filters or board preferences for selection-only route changes', async () => {
+    window.location.hash = '#/issues';
+    document.body.innerHTML = '<main id="app"></main>';
+    const root = /** @type {HTMLElement} */ (document.getElementById('app'));
+
+    bootstrap(root);
+    await flushPromises();
+
+    const set_item = vi.spyOn(Storage.prototype, 'setItem');
+    window.location.hash = '#/issues?issue=UI-LOCAL';
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await flushPromises();
+
+    const persisted_keys = set_item.mock.calls
+      .map((call) => String(call[0]))
+      .filter((key) => key === 'beads-ui.filters' || key === 'beads-ui.board');
+    expect(persisted_keys).toEqual([]);
+
+    set_item.mockRestore();
+  });
 });

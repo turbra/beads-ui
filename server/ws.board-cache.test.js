@@ -48,13 +48,23 @@ function createSocket() {
  * @param {ReturnType<typeof createSocket>} sock
  */
 async function subscribeBoardReady(sock) {
+  await subscribeList(sock, 'tab:board:ready', 'ready-issues');
+}
+
+/**
+ * @param {ReturnType<typeof createSocket>} sock
+ * @param {string} id
+ * @param {string} type
+ * @param {Record<string, string | number | boolean>} [params]
+ */
+async function subscribeList(sock, id, type, params = undefined) {
   await handleMessage(
     /** @type {any} */ (sock),
     Buffer.from(
       JSON.stringify({
-        id: 'sub-board-ready',
+        id: `sub-${id}`,
         type: /** @type {any} */ ('subscribe-list'),
-        payload: { id: 'tab:board:ready', type: 'ready-issues' }
+        payload: params ? { id, type, params } : { id, type }
       })
     )
   );
@@ -142,6 +152,43 @@ describe('ws board cache', () => {
     expect(findSnapshot(second_sock).payload.issues).toEqual(
       makeItems({ type: 'ready-issues' })
     );
+    wss.close();
+  });
+
+  test('refresh populates board cache before prewarm runs', async () => {
+    const server = createServer();
+    const { scheduleListRefresh, wss } = attachWsServer(server, {
+      path: '/ws',
+      prewarm_board_cache: true,
+      refresh_debounce_ms: 0
+    });
+    const mock = resetAdapterMock();
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mock.mockClear();
+
+    const sock = createSocket();
+    wss.clients.add(/** @type {any} */ (sock));
+    const since = new Date(
+      new Date().getFullYear(),
+      new Date().getMonth(),
+      new Date().getDate(),
+      0,
+      0,
+      0,
+      0
+    ).getTime();
+    await subscribeList(sock, 'tab:board:ready', 'ready-issues');
+    await subscribeList(sock, 'tab:board:blocked', 'blocked-issues');
+    await subscribeList(sock, 'tab:board:in-progress', 'in-progress-issues');
+    await subscribeList(sock, 'tab:board:closed', 'closed-issues', { since });
+
+    expect(mock).not.toHaveBeenCalled();
+
+    scheduleListRefresh();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(mock).toHaveBeenCalledTimes(4);
     wss.close();
   });
 });

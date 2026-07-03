@@ -1,4 +1,5 @@
 import { html, render } from 'lit-html';
+import { repeat } from 'lit-html/directives/repeat.js';
 import { createListSelectors } from '../data/list-selectors.js';
 import { cmpClosedDesc } from '../data/sort.js';
 import { ISSUE_TYPES, typeLabel } from '../utils/issue-type.js';
@@ -315,7 +316,7 @@ export function createListView(
                   </tr>
                 </thead>
                 <tbody role="rowgroup">
-                  ${filtered.map((it) => row_renderer(it))}
+                  ${repeat(filtered, (it) => it.id, row_renderer)}
                 </tbody>
               </table>
             </div>`}
@@ -559,8 +560,10 @@ export function createListView(
   }
 
   // Live updates: recompose and re-render when issue stores change
+  /** @type {(() => void) | null} */
+  let unsubscribe_selectors = null;
   if (selectors) {
-    selectors.subscribe(() => {
+    unsubscribe_selectors = selectors.subscribe(() => {
       try {
         issues_cache = /** @type {Issue[]} */ (
           selectors.selectIssuesFor('tab:issues')
@@ -569,7 +572,7 @@ export function createListView(
       } catch {
         // ignore
       }
-    });
+    }, 'tab:issues');
   }
 
   return {
@@ -580,6 +583,10 @@ export function createListView(
       if (unsubscribe) {
         unsubscribe();
         unsubscribe = null;
+      }
+      if (unsubscribe_selectors) {
+        unsubscribe_selectors();
+        unsubscribe_selectors = null;
       }
     }
   };

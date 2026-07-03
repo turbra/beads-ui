@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'vitest';
 import { createSubscriptionIssueStore } from './subscription-issue-store.js';
 
+async function flushMicrotasks() {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 describe('subscription issue store', () => {
   test('applies snapshot and returns sorted snapshot', () => {
     const store = createSubscriptionIssueStore('s1');
@@ -286,7 +291,7 @@ describe('subscription issue store', () => {
     expect(ids).toEqual(['B']);
   });
 
-  test('subscribe emits exactly once per applyPush', () => {
+  test('subscribe coalesces a synchronous applyPush burst', async () => {
     const store = createSubscriptionIssueStore('s1');
     let count = 0;
     store.subscribe(() => {
@@ -312,10 +317,31 @@ describe('subscription issue store', () => {
         closed_at: null
       }
     });
+    expect(count).toBe(0);
+
+    await flushMicrotasks();
+
+    expect(count).toBe(1);
+
+    store.applyPush({
+      type: 'upsert',
+      id: 's1',
+      revision: 3,
+      issue: {
+        id: 'A',
+        title: 't2',
+        created_at: 10_000,
+        updated_at: 10_070,
+        closed_at: null
+      }
+    });
+
+    await flushMicrotasks();
+
     expect(count).toBe(2);
   });
 
-  test('dispose clears listeners and state', () => {
+  test('dispose clears listeners and state', async () => {
     const store = createSubscriptionIssueStore('s1');
     let hit = 0;
     store.subscribe(() => {
@@ -330,6 +356,8 @@ describe('subscription issue store', () => {
         { id: 'A', created_at: 10_000, updated_at: 10_000, closed_at: null }
       ]
     });
+    await flushMicrotasks();
+
     expect(hit).toBe(0);
     expect(store.size()).toBe(0);
   });
