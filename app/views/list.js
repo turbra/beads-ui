@@ -11,10 +11,65 @@ import { createIssueRowRenderer } from './issue-row.js';
 
 export const ISSUES_SEGMENT_SIZE = 200;
 
+const COLUMN_WIDTHS_STORAGE_KEY = 'beads-ui.issues.column-widths';
+const COLUMN_MAX_WIDTH = 1200;
+
+/** @type {readonly IssueColumn[]} */
+const ISSUE_COLUMNS = Object.freeze([
+  { key: 'id', label: 'ID', default_width: 150, min_width: 100 },
+  { key: 'type', label: 'Type', default_width: 120, min_width: 90 },
+  { key: 'title', label: 'Title', default_width: 360, min_width: 180 },
+  { key: 'status', label: 'Status', default_width: 130, min_width: 110 },
+  { key: 'assignee', label: 'Assignee', default_width: 180, min_width: 120 },
+  { key: 'priority', label: 'Priority', default_width: 145, min_width: 120 },
+  { key: 'updated', label: 'Updated', default_width: 180, min_width: 140 },
+  {
+    key: 'dependencies',
+    label: 'Deps',
+    default_width: 90,
+    min_width: 70
+  }
+]);
+
 /**
  * @typedef {{ id: string, title?: string, status?: 'closed'|'open'|'in_progress', priority?: number, issue_type?: string, assignee?: string, labels?: string[], dependency_count?: number, dependent_count?: number, updated_at?: string | number }} Issue
  * @typedef {'id'|'type'|'title'|'status'|'assignee'|'priority'|'updated'|'dependencies'} SortKey
+ * @typedef {{ key: SortKey, label: string, default_width: number, min_width: number }} IssueColumn
+ * @typedef {{ key: SortKey, start_x: number, start_width: number }} ActiveResize
  */
+
+/**
+ * Load validated browser-local column widths.
+ *
+ * @returns {Record<SortKey, number>}
+ */
+function loadColumnWidths() {
+  /** @type {Record<string, unknown>} */
+  let stored_widths = {};
+  try {
+    const stored_value = window.localStorage.getItem(COLUMN_WIDTHS_STORAGE_KEY);
+    const parsed_value = stored_value ? JSON.parse(stored_value) : {};
+    if (parsed_value && typeof parsed_value === 'object') {
+      stored_widths = parsed_value;
+    }
+  } catch {
+    // Storage can be unavailable or contain malformed data.
+  }
+
+  /** @type {Record<SortKey, number>} */
+  const widths = /** @type {Record<SortKey, number>} */ ({});
+  for (const column of ISSUE_COLUMNS) {
+    const stored_width = stored_widths[column.key];
+    widths[column.key] =
+      typeof stored_width === 'number' &&
+      Number.isFinite(stored_width) &&
+      stored_width >= column.min_width &&
+      stored_width <= COLUMN_MAX_WIDTH
+        ? Math.round(stored_width)
+        : column.default_width;
+  }
+  return widths;
+}
 
 /**
  * Create the Issues List view.
@@ -64,6 +119,9 @@ export function createListView(
   let sort_key = null;
   /** @type {'asc'|'desc'} */
   let sort_direction = 'asc';
+  const column_widths = loadColumnWidths();
+  /** @type {ActiveResize | null} */
+  let active_resize = null;
   /** @type {ReturnType<typeof setTimeout> | null} */
   let search_timer = null;
   let visible_limit = ISSUES_SEGMENT_SIZE;
@@ -335,13 +393,138 @@ export function createListView(
     });
   }
 
+  /** Persist the current column widths when browser storage is available. */
+  function persistColumnWidths() {
+    try {
+      window.localStorage.setItem(
+        COLUMN_WIDTHS_STORAGE_KEY,
+        JSON.stringify(column_widths)
+      );
+    } catch {
+      // Resizing still works for the current view when storage is unavailable.
+    }
+  }
+
+  /** @returns {number} */
+  function tableWidth() {
+    return ISSUE_COLUMNS.reduce(
+      (total, column) => total + column_widths[column.key],
+      0
+    );
+  }
+
+  /**
+   * Clamp and apply a column width without re-rendering the table during drag.
+   *
+   * @param {IssueColumn} column
+   * @param {number} requested_width
+   */
+  function applyColumnWidth(column, requested_width) {
+    const next_width = Math.min(
+      COLUMN_MAX_WIDTH,
+      Math.max(column.min_width, Math.round(requested_width))
+    );
+    column_widths[column.key] = next_width;
+    const col = /** @type {HTMLTableColElement | null} */ (
+      mount_element.querySelector(`col[data-column="${column.key}"]`)
+    );
+    if (col) {
+      col.style.width = `${next_width}px`;
+    }
+    const table = /** @type {HTMLTableElement | null} */ (
+      mount_element.querySelector('table.table')
+    );
+    if (table) {
+      table.style.width = `${tableWidth()}px`;
+    }
+    const handle = /** @type {HTMLElement | null} */ (
+      mount_element.querySelector(
+        `.column-resizer[data-column="${column.key}"]`
+      )
+    );
+    handle?.setAttribute('aria-valuenow', String(next_width));
+  }
+
+  /** @param {PointerEvent} event */
+  function resizeColumn(event) {
+    if (!active_resize) {
+      return;
+    }
+    const column = ISSUE_COLUMNS.find(
+      (candidate) => candidate.key === active_resize?.key
+    );
+    if (!column) {
+      return;
+    }
+    applyColumnWidth(
+      column,
+      active_resize.start_width + event.clientX - active_resize.start_x
+    );
+  }
+
+  /** Finish the active pointer resize and save its width. */
+  function finishColumnResize() {
+    if (!active_resize) {
+      return;
+    }
+    active_resize = null;
+    window.removeEventListener('pointermove', resizeColumn);
+    window.removeEventListener('pointerup', finishColumnResize);
+    window.removeEventListener('pointercancel', finishColumnResize);
+    document.body.classList.remove('is-resizing-column');
+    persistColumnWidths();
+  }
+
+  /**
+   * Begin resizing a column with the pointer.
+   *
+   * @param {PointerEvent} event
+   * @param {IssueColumn} column
+   */
+  function startColumnResize(event, column) {
+    event.preventDefault();
+    event.stopPropagation();
+    finishColumnResize();
+    active_resize = {
+      key: column.key,
+      start_x: event.clientX,
+      start_width: column_widths[column.key]
+    };
+    window.addEventListener('pointermove', resizeColumn);
+    window.addEventListener('pointerup', finishColumnResize);
+    window.addEventListener('pointercancel', finishColumnResize);
+    document.body.classList.add('is-resizing-column');
+  }
+
+  /**
+   * Resize a column from its keyboard-accessible separator.
+   *
+   * @param {KeyboardEvent} event
+   * @param {IssueColumn} column
+   */
+  function resizeColumnByKeyboard(event, column) {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const step = event.shiftKey ? 40 : 16;
+    const direction = event.key === 'ArrowLeft' ? -1 : 1;
+    applyColumnWidth(column, column_widths[column.key] + step * direction);
+    persistColumnWidths();
+  }
+
   /**
    * @param {SortKey} key
    * @param {string} label
    */
   function sortHeader(key, label) {
     const active = sort_key === key;
+    const column = /** @type {IssueColumn} */ (
+      ISSUE_COLUMNS.find((candidate) => candidate.key === key)
+    );
     return html`<th
+      class="resizable-header"
       role="columnheader"
       aria-sort=${active
         ? sort_direction === 'asc'
@@ -357,6 +540,25 @@ export function createListView(
       >
         ${label}
       </button>
+      <span
+        class="column-resizer"
+        data-column=${key}
+        role="separator"
+        aria-label=${`Resize ${label} column`}
+        aria-orientation="vertical"
+        aria-valuemin=${String(column.min_width)}
+        aria-valuemax=${String(COLUMN_MAX_WIDTH)}
+        aria-valuenow=${String(column_widths[key])}
+        tabindex="0"
+        @pointerdown=${
+          /** @param {PointerEvent} event */ (event) =>
+            startColumnResize(event, column)
+        }
+        @keydown=${
+          /** @param {KeyboardEvent} event */ (event) =>
+            resizeColumnByKeyboard(event, column)
+        }
+      ></span>
     </th>`;
   }
 
@@ -546,37 +748,35 @@ export function createListView(
               </div>
             </div>`
           : html`<div class="issues-block">
-              <table
-                class="table"
-                role="grid"
-                aria-rowcount=${String(total_count + 1)}
-                aria-colcount="8"
-              >
-                <colgroup>
-                  <col style="width: 100px" />
-                  <col style="width: 120px" />
-                  <col />
-                  <col style="width: 120px" />
-                  <col style="width: 160px" />
-                  <col style="width: 130px" />
-                  <col style="width: 180px" />
-                  <col style="width: 80px" />
-                </colgroup>
-                <thead>
-                  <tr role="row" aria-rowindex="1">
-                    ${sortHeader('id', 'ID')} ${sortHeader('type', 'Type')}
-                    ${sortHeader('title', 'Title')}
-                    ${sortHeader('status', 'Status')}
-                    ${sortHeader('assignee', 'Assignee')}
-                    ${sortHeader('priority', 'Priority')}
-                    ${sortHeader('updated', 'Updated')}
-                    ${sortHeader('dependencies', 'Deps')}
-                  </tr>
-                </thead>
-                <tbody role="rowgroup">
-                  ${repeat(visible, (it) => it.id, row_renderer)}
-                </tbody>
-              </table>
+              <div class="issues-table-scroll">
+                <table
+                  class="table"
+                  style=${`width: ${tableWidth()}px`}
+                  role="grid"
+                  aria-rowcount=${String(total_count + 1)}
+                  aria-colcount="8"
+                >
+                  <colgroup>
+                    ${ISSUE_COLUMNS.map(
+                      (column) =>
+                        html`<col
+                          data-column=${column.key}
+                          style=${`width: ${column_widths[column.key]}px`}
+                        />`
+                    )}
+                  </colgroup>
+                  <thead>
+                    <tr role="row" aria-rowindex="1">
+                      ${ISSUE_COLUMNS.map((column) =>
+                        sortHeader(column.key, column.label)
+                      )}
+                    </tr>
+                  </thead>
+                  <tbody role="rowgroup">
+                    ${repeat(visible, (it) => it.id, row_renderer)}
+                  </tbody>
+                </table>
+              </div>
               <div class="progressive-list">
                 <div
                   class="progressive-list__status"
@@ -890,6 +1090,7 @@ export function createListView(
       return document.activeElement === input;
     },
     destroy() {
+      finishColumnResize();
       mount_element.replaceChildren();
       if (search_timer) {
         clearTimeout(search_timer);

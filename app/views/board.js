@@ -17,7 +17,9 @@ import { createTypeBadge } from '../utils/type-badge.js';
  *   issue_type?: string,
  *   created_at?: number,
  *   updated_at?: number,
- *   closed_at?: number
+ *   closed_at?: number,
+ *   blocked_by_count?: number,
+ *   blocked_by?: string[]
  * }} IssueLite
  */
 
@@ -27,11 +29,18 @@ import { createTypeBadge } from '../utils/type-badge.js';
  * @type {Record<string, 'open'|'in_progress'|'closed'>}
  */
 const COLUMN_STATUS_MAP = {
-  'blocked-col': 'open',
   'ready-col': 'open',
   'in-progress-col': 'in_progress',
   'closed-col': 'closed'
 };
+
+/** @type {Readonly<Record<string, string>>} */
+const COLUMN_DESCRIPTIONS = Object.freeze({
+  'blocked-col': 'Open issues waiting on unresolved dependencies',
+  'ready-col': 'Open issues with no unresolved dependencies',
+  'in-progress-col': 'Issues currently being worked',
+  'closed-col': 'Recently completed issues'
+});
 
 const BOARD_CLIENT_IDS = [
   'tab:board:ready',
@@ -100,8 +109,12 @@ export function createBoardView(
   function template() {
     return html`
       <div class="panel__body board-root">
-        ${columnTemplate('Blocked', 'blocked-col', list_blocked)}
-        ${columnTemplate('Ready', 'ready-col', list_ready)}
+        ${columnTemplate(
+          'Blocked by dependencies',
+          'blocked-col',
+          list_blocked
+        )}
+        ${columnTemplate('Ready to work', 'ready-col', list_ready)}
         ${columnTemplate('In Progress', 'in-progress-col', list_in_progress)}
         ${columnTemplate('Closed', 'closed-col', list_closed)}
       </div>
@@ -124,11 +137,16 @@ export function createBoardView(
           role="heading"
           aria-level="2"
         >
-          <div class="board-column__title">
-            <span class="board-column__title-text">${title}</span>
-            <span class="badge board-column__count" aria-label=${count_label}>
-              ${item_count}
-            </span>
+          <div class="board-column__heading">
+            <div class="board-column__title">
+              <span class="board-column__title-text">${title}</span>
+              <span class="badge board-column__count" aria-label=${count_label}>
+                ${item_count}
+              </span>
+            </div>
+            <div class="board-column__description">
+              ${COLUMN_DESCRIPTIONS[id] || ''}
+            </div>
           </div>
           ${id === 'closed-col'
             ? html`<label class="board-closed-filter">
@@ -162,7 +180,7 @@ export function createBoardView(
           ${repeat(
             items,
             (it) => it.id,
-            (it) => cardTemplate(it, title)
+            (it) => cardTemplate(it, title, id)
           )}
         </div>
       </section>
@@ -172,8 +190,9 @@ export function createBoardView(
   /**
    * @param {IssueLite} it
    * @param {string} column_title
+   * @param {string} column_id
    */
-  function cardTemplate(it, column_title) {
+  function cardTemplate(it, column_title, column_id) {
     const title = it.title || '(no title)';
     return html`
       <article
@@ -192,8 +211,49 @@ export function createBoardView(
           ${createTypeBadge(it.issue_type)} ${createPriorityBadge(it.priority)}
           ${createIssueIdRenderer(it.id, { class_name: 'mono' })}
         </div>
+        ${column_id === 'blocked-col' ? blockedByTemplate(it) : null}
       </article>
     `;
+  }
+
+  /**
+   * Render dependency context for an issue returned by `bd blocked`.
+   *
+   * @param {IssueLite} issue
+   */
+  function blockedByTemplate(issue) {
+    const blocker_ids = Array.isArray(issue.blocked_by)
+      ? issue.blocked_by.map(String).filter(Boolean)
+      : [];
+    const reported_count = Number(issue.blocked_by_count || 0);
+    const blocker_count = Math.max(reported_count, blocker_ids.length);
+    if (blocker_count === 0) {
+      return null;
+    }
+    return html`<div class="board-card__blocked-by">
+      <div class="board-card__blocked-label">
+        Blocked by ${blocker_count}
+        ${blocker_count === 1 ? 'dependency' : 'dependencies'}
+      </div>
+      ${blocker_ids.length > 0
+        ? html`<div class="board-card__blockers">
+            ${blocker_ids.map(
+              (blocker_id) =>
+                html`<button
+                  type="button"
+                  class="board-card__blocker-id"
+                  aria-label=${`Open blocking issue ${blocker_id}`}
+                  @click=${(/** @type {MouseEvent} */ event) => {
+                    event.stopPropagation();
+                    gotoIssue(blocker_id);
+                  }}
+                >
+                  ${blocker_id}
+                </button>`
+            )}
+          </div>`
+        : null}
+    </div>`;
   }
 
   /** @type {string|null} */
@@ -257,6 +317,7 @@ export function createBoardView(
     for (const c of all_cols) {
       c.classList.remove('board-column--drag-over');
     }
+    current_drop_target = null;
   }
 
   /**
@@ -264,8 +325,13 @@ export function createBoardView(
    *
    * @param {string} issue_id
    * @param {'open'|'in_progress'|'closed'} new_status
+   * @param {string} [success_message]
    */
-  async function updateIssueStatus(issue_id, new_status) {
+  async function updateIssueStatus(
+    issue_id,
+    new_status,
+    success_message = 'Status updated'
+  ) {
     if (!transport) {
       log('no transport available, status update skipped');
       showToast('Cannot update status: not connected', 'error');
@@ -274,7 +340,7 @@ export function createBoardView(
     try {
       log('update-status %s → %s', issue_id, new_status);
       await transport('update-status', { id: issue_id, status: new_status });
-      showToast('Status updated', 'success', 1500);
+      showToast(success_message, 'success', 2500);
     } catch (err) {
       log('update-status failed: %o', err);
       showToast('Failed to update status', 'error');
@@ -425,15 +491,21 @@ export function createBoardView(
 
   // Delegate drag and drop handling for columns
   mount_element.addEventListener('dragover', (ev) => {
-    ev.preventDefault();
-    if (ev.dataTransfer) {
-      ev.dataTransfer.dropEffect = 'move';
-    }
-    // Find the column being dragged over
     const target = /** @type {HTMLElement} */ (ev.target);
     const col = /** @type {HTMLElement|null} */ (
       target.closest('.board-column')
     );
+    if (!col || col.id === 'blocked-col') {
+      clearDropTarget();
+      if (ev.dataTransfer) {
+        ev.dataTransfer.dropEffect = 'none';
+      }
+      return;
+    }
+    ev.preventDefault();
+    if (ev.dataTransfer) {
+      ev.dataTransfer.dropEffect = 'move';
+    }
 
     // Only update if we've entered a different column
     if (col && col !== current_drop_target) {
@@ -473,6 +545,10 @@ export function createBoardView(
     }
 
     const col_id = col.id;
+    if (col_id === 'blocked-col') {
+      showToast('Blocked state is determined by issue dependencies', 'info');
+      return;
+    }
     const new_status = COLUMN_STATUS_MAP[col_id];
     if (!new_status) {
       log('drop on unknown column: %s', col_id);
@@ -486,7 +562,11 @@ export function createBoardView(
     }
 
     log('drop %s on %s → %s', issue_id, col_id, new_status);
-    void updateIssueStatus(issue_id, new_status);
+    const success_message =
+      col_id === 'ready-col'
+        ? 'Issue reopened; dependencies determine Board placement'
+        : 'Status updated';
+    void updateIssueStatus(issue_id, new_status, success_message);
   });
 
   /**

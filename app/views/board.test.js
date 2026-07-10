@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { createSubscriptionIssueStore } from '../data/subscription-issue-store.js';
 import { createBoardView } from './board.js';
 
@@ -40,6 +40,20 @@ function createTestIssueStores() {
       return () => listeners.delete(fn);
     }
   };
+}
+
+/**
+ * Dispatch a board drop with the issue ID normally supplied by DataTransfer.
+ *
+ * @param {Element} target
+ * @param {string} issue_id
+ */
+function dropIssueOn(target, issue_id) {
+  const event = new Event('drop', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'dataTransfer', {
+    value: { getData: () => issue_id }
+  });
+  target.dispatchEvent(event);
 }
 
 describe('views/board', () => {
@@ -303,6 +317,118 @@ describe('views/board', () => {
       .querySelector('#closed-col .board-column__count')
       ?.getAttribute('aria-label');
     expect(closed_label).toBe('1 issue');
+  });
+
+  test('explains dependency semantics in Blocked and Ready headings', async () => {
+    document.body.innerHTML = '<div id="m"></div>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('m'));
+    const view = createBoardView(
+      mount,
+      () => {},
+      undefined,
+      createTestIssueStores()
+    );
+
+    await view.load();
+
+    expect(
+      mount.querySelector('#blocked-col .board-column__title-text')?.textContent
+    ).toBe('Blocked by dependencies');
+    expect(
+      mount.querySelector('#blocked-col .board-column__description')
+        ?.textContent
+    ).toContain('waiting on unresolved dependencies');
+    expect(
+      mount.querySelector('#ready-col .board-column__title-text')?.textContent
+    ).toBe('Ready to work');
+  });
+
+  test('shows and navigates to blocking issue IDs', async () => {
+    document.body.innerHTML = '<div id="m"></div>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('m'));
+    const issueStores = createTestIssueStores();
+    issueStores.getStore('tab:board:blocked').applyPush({
+      type: 'snapshot',
+      id: 'tab:board:blocked',
+      revision: 1,
+      issues: [
+        {
+          id: 'BLOCKED-1',
+          title: 'Waiting issue',
+          status: 'open',
+          blocked_by_count: 2,
+          blocked_by: ['ROOT-1', 'ROOT-2']
+        }
+      ]
+    });
+    /** @type {string[]} */
+    const navigations = [];
+    const view = createBoardView(
+      mount,
+      (id) => navigations.push(id),
+      undefined,
+      issueStores
+    );
+    await view.load();
+
+    const blocker = /** @type {HTMLButtonElement} */ (
+      mount.querySelector('[aria-label="Open blocking issue ROOT-2"]')
+    );
+    blocker.click();
+
+    expect(
+      mount
+        .querySelector('.board-card__blocked-label')
+        ?.textContent?.replace(/\s+/g, ' ')
+        .trim()
+    ).toBe('Blocked by 2 dependencies');
+    expect(navigations).toEqual(['ROOT-2']);
+  });
+
+  test('rejects drops into the dependency-derived Blocked column', async () => {
+    document.body.innerHTML = '<div id="m"></div>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('m'));
+    const transport = vi.fn(async () => ({}));
+    const view = createBoardView(
+      mount,
+      () => {},
+      undefined,
+      createTestIssueStores(),
+      transport
+    );
+    await view.load();
+
+    dropIssueOn(
+      /** @type {Element} */ (document.getElementById('blocked-col')),
+      'ISSUE-1'
+    );
+
+    expect(transport).not.toHaveBeenCalled();
+  });
+
+  test('reopens issues dropped into Ready for dependency classification', async () => {
+    document.body.innerHTML = '<div id="m"></div>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('m'));
+    const transport = vi.fn(async () => ({}));
+    const view = createBoardView(
+      mount,
+      () => {},
+      undefined,
+      createTestIssueStores(),
+      transport
+    );
+    await view.load();
+
+    dropIssueOn(
+      /** @type {Element} */ (document.getElementById('ready-col')),
+      'ISSUE-1'
+    );
+    await Promise.resolve();
+
+    expect(transport).toHaveBeenCalledWith('update-status', {
+      id: 'ISSUE-1',
+      status: 'open'
+    });
   });
 
   test('filters Ready to exclude items that are In Progress', async () => {

@@ -834,6 +834,108 @@ describe('views/list', () => {
     ).toBe('Updated');
   });
 
+  test('renders an accessible resize control for every issue column', async () => {
+    window.localStorage.removeItem('beads-ui.issues.column-widths');
+    document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const issueStores = createTestIssueStores();
+    issueStores.getStore('tab:issues').applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 1,
+      issues: [{ id: 'UI-LONG-ID', title: 'A long issue title' }]
+    });
+    const view = createListView(
+      mount,
+      async () => [],
+      undefined,
+      undefined,
+      issueStores
+    );
+
+    await view.load();
+
+    const handles = mount.querySelectorAll(
+      '.column-resizer[role="separator"][aria-orientation="vertical"]'
+    );
+    expect(handles).toHaveLength(8);
+    expect(
+      mount.querySelector('col[data-column="id"]')?.getAttribute('style')
+    ).toContain('150px');
+    expect(
+      mount.querySelector('col[data-column="title"]')?.getAttribute('style')
+    ).toContain('360px');
+    view.destroy();
+  });
+
+  test('resizes an issue column with the keyboard', async () => {
+    window.localStorage.removeItem('beads-ui.issues.column-widths');
+    document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const issueStores = createTestIssueStores();
+    issueStores.getStore('tab:issues').applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 1,
+      issues: [{ id: 'UI-1', title: 'One' }]
+    });
+    const view = createListView(
+      mount,
+      async () => [],
+      undefined,
+      undefined,
+      issueStores
+    );
+    await view.load();
+    const handle = /** @type {HTMLElement} */ (
+      mount.querySelector('[aria-label="Resize Title column"]')
+    );
+
+    handle.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })
+    );
+
+    expect(
+      mount.querySelector('col[data-column="title"]')?.getAttribute('style')
+    ).toContain('376px');
+    expect(handle.getAttribute('aria-valuenow')).toBe('376');
+    view.destroy();
+  });
+
+  test('restores valid persisted issue column widths', async () => {
+    window.localStorage.setItem(
+      'beads-ui.issues.column-widths',
+      JSON.stringify({ id: 240, title: 520 })
+    );
+    document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const issueStores = createTestIssueStores();
+    issueStores.getStore('tab:issues').applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 1,
+      issues: [{ id: 'UI-1', title: 'One' }]
+    });
+    const view = createListView(
+      mount,
+      async () => [],
+      undefined,
+      undefined,
+      issueStores
+    );
+
+    await view.load();
+
+    expect(
+      mount.querySelector('col[data-column="id"]')?.getAttribute('style')
+    ).toContain('240px');
+    expect(
+      mount.querySelector('col[data-column="title"]')?.getAttribute('style')
+    ).toContain('520px');
+    view.destroy();
+    window.localStorage.removeItem('beads-ui.issues.column-widths');
+  });
+
   test('sorts every data column in both directions with stable ID ties', async () => {
     document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
     const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));

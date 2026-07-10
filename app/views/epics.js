@@ -3,9 +3,67 @@ import { createListSelectors } from '../data/list-selectors.js';
 import { createIssueIdRenderer } from '../utils/issue-id-renderer.js';
 import { createIssueRowRenderer } from './issue-row.js';
 
+const EPICS_COLUMN_WIDTHS_STORAGE_KEY = 'beads-ui.epics.column-widths';
+const EPICS_COLUMN_MAX_WIDTH = 1200;
+
+/** @type {readonly EpicColumn[]} */
+const EPIC_COLUMNS = Object.freeze([
+  { key: 'id', label: 'ID', default_width: 150, min_width: 100 },
+  { key: 'type', label: 'Type', default_width: 120, min_width: 90 },
+  { key: 'title', label: 'Title', default_width: 360, min_width: 180 },
+  { key: 'status', label: 'Status', default_width: 130, min_width: 110 },
+  { key: 'assignee', label: 'Assignee', default_width: 180, min_width: 120 },
+  { key: 'priority', label: 'Priority', default_width: 145, min_width: 120 },
+  { key: 'updated', label: 'Updated', default_width: 180, min_width: 140 },
+  {
+    key: 'dependencies',
+    label: 'Deps',
+    default_width: 90,
+    min_width: 70
+  }
+]);
+
 /**
  * @typedef {{ id: string, title?: string, status?: string, priority?: number, issue_type?: string, assignee?: string, created_at?: string | number, updated_at?: string | number }} IssueLite
+ * @typedef {'id'|'type'|'title'|'status'|'assignee'|'priority'|'updated'|'dependencies'} EpicColumnKey
+ * @typedef {{ key: EpicColumnKey, label: string, default_width: number, min_width: number }} EpicColumn
+ * @typedef {{ key: EpicColumnKey, start_x: number, start_width: number }} ActiveResize
  */
+
+/**
+ * Load validated Epics column widths from browser-local storage.
+ *
+ * @returns {Record<EpicColumnKey, number>}
+ */
+function loadEpicColumnWidths() {
+  /** @type {Record<string, unknown>} */
+  let stored_widths = {};
+  try {
+    const stored_value = window.localStorage.getItem(
+      EPICS_COLUMN_WIDTHS_STORAGE_KEY
+    );
+    const parsed_value = stored_value ? JSON.parse(stored_value) : {};
+    if (parsed_value && typeof parsed_value === 'object') {
+      stored_widths = parsed_value;
+    }
+  } catch {
+    // Storage can be unavailable or contain malformed data.
+  }
+
+  /** @type {Record<EpicColumnKey, number>} */
+  const widths = /** @type {Record<EpicColumnKey, number>} */ ({});
+  for (const column of EPIC_COLUMNS) {
+    const stored_width = stored_widths[column.key];
+    widths[column.key] =
+      typeof stored_width === 'number' &&
+      Number.isFinite(stored_width) &&
+      stored_width >= column.min_width &&
+      stored_width <= EPICS_COLUMN_MAX_WIDTH
+        ? Math.round(stored_width)
+        : column.default_width;
+  }
+  return widths;
+}
 
 /**
  * Epics view (push-only):
@@ -40,6 +98,9 @@ export function createEpicsView(
   let sort_key = null;
   /** @type {'asc'|'desc'} */
   let sort_direction = 'asc';
+  const column_widths = loadEpicColumnWidths();
+  /** @type {ActiveResize | null} */
+  let active_resize = null;
   // Centralized selection helpers
   const selectors = issue_stores ? createListSelectors(issue_stores) : null;
 
@@ -135,6 +196,172 @@ export function createEpicsView(
     });
   }
 
+  /** Persist the current Epics column widths when storage is available. */
+  function persistColumnWidths() {
+    try {
+      window.localStorage.setItem(
+        EPICS_COLUMN_WIDTHS_STORAGE_KEY,
+        JSON.stringify(column_widths)
+      );
+    } catch {
+      // Resizing still works for the current view when storage is unavailable.
+    }
+  }
+
+  /** @returns {number} */
+  function tableWidth() {
+    return EPIC_COLUMNS.reduce(
+      (total, column) => total + column_widths[column.key],
+      0
+    );
+  }
+
+  /**
+   * Apply one width to the matching column in every expanded epic table.
+   *
+   * @param {EpicColumn} column
+   * @param {number} requested_width
+   */
+  function applyColumnWidth(column, requested_width) {
+    const next_width = Math.min(
+      EPICS_COLUMN_MAX_WIDTH,
+      Math.max(column.min_width, Math.round(requested_width))
+    );
+    column_widths[column.key] = next_width;
+    const cols = mount_element.querySelectorAll(
+      `col[data-epic-column="${column.key}"]`
+    );
+    cols.forEach((col) => {
+      /** @type {HTMLTableColElement} */ (col).style.width = `${next_width}px`;
+    });
+    const tables = mount_element.querySelectorAll('table.epics-children-table');
+    tables.forEach((table) => {
+      /** @type {HTMLTableElement} */ (table).style.width = `${tableWidth()}px`;
+    });
+    const handles = mount_element.querySelectorAll(
+      `.column-resizer[data-epic-column="${column.key}"]`
+    );
+    handles.forEach((handle) => {
+      handle.setAttribute('aria-valuenow', String(next_width));
+    });
+  }
+
+  /** @param {PointerEvent} event */
+  function resizeColumn(event) {
+    if (!active_resize) {
+      return;
+    }
+    const column = EPIC_COLUMNS.find(
+      (candidate) => candidate.key === active_resize?.key
+    );
+    if (!column) {
+      return;
+    }
+    applyColumnWidth(
+      column,
+      active_resize.start_width + event.clientX - active_resize.start_x
+    );
+  }
+
+  /** Finish the active pointer resize and save its width. */
+  function finishColumnResize() {
+    if (!active_resize) {
+      return;
+    }
+    active_resize = null;
+    window.removeEventListener('pointermove', resizeColumn);
+    window.removeEventListener('pointerup', finishColumnResize);
+    window.removeEventListener('pointercancel', finishColumnResize);
+    document.body.classList.remove('is-resizing-column');
+    persistColumnWidths();
+  }
+
+  /**
+   * @param {PointerEvent} event
+   * @param {EpicColumn} column
+   */
+  function startColumnResize(event, column) {
+    event.preventDefault();
+    event.stopPropagation();
+    finishColumnResize();
+    active_resize = {
+      key: column.key,
+      start_x: event.clientX,
+      start_width: column_widths[column.key]
+    };
+    window.addEventListener('pointermove', resizeColumn);
+    window.addEventListener('pointerup', finishColumnResize);
+    window.addEventListener('pointercancel', finishColumnResize);
+    document.body.classList.add('is-resizing-column');
+  }
+
+  /**
+   * @param {KeyboardEvent} event
+   * @param {EpicColumn} column
+   */
+  function resizeColumnByKeyboard(event, column) {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const step = event.shiftKey ? 40 : 16;
+    const direction = event.key === 'ArrowLeft' ? -1 : 1;
+    applyColumnWidth(column, column_widths[column.key] + step * direction);
+    persistColumnWidths();
+  }
+
+  /**
+   * Render a resizable Epics child-table header.
+   *
+   * @param {EpicColumn} column
+   */
+  function columnHeader(column) {
+    const is_sortable = column.key === 'priority' || column.key === 'updated';
+    const is_active_sort = is_sortable && sort_key === column.key;
+    return html`<th
+      class="resizable-header"
+      role="columnheader"
+      aria-sort=${is_sortable
+        ? is_active_sort
+          ? sort_direction === 'asc'
+            ? 'ascending'
+            : 'descending'
+          : 'none'
+        : undefined}
+    >
+      ${is_sortable
+        ? html`<button
+            type="button"
+            class="sort-header"
+            @click=${() =>
+              toggleSort(/** @type {'priority'|'updated'} */ (column.key))}
+          >
+            ${column.label}
+          </button>`
+        : column.label}
+      <span
+        class="column-resizer"
+        data-epic-column=${column.key}
+        role="separator"
+        aria-label=${`Resize ${column.label} column`}
+        aria-orientation="vertical"
+        aria-valuemin=${String(column.min_width)}
+        aria-valuemax=${String(EPICS_COLUMN_MAX_WIDTH)}
+        aria-valuenow=${String(column_widths[column.key])}
+        tabindex="0"
+        @pointerdown=${
+          /** @param {PointerEvent} event */ (event) =>
+            startColumnResize(event, column)
+        }
+        @keydown=${
+          /** @param {KeyboardEvent} event */ (event) =>
+            resizeColumnByKeyboard(event, column)
+        }
+      ></span>
+    </th>`;
+  }
+
   function template() {
     if (!groups.length) {
       return html`<div class="panel__header muted">No epics found.</div>`;
@@ -186,68 +413,33 @@ export function createEpicsView(
                 ? html`<div class="muted">Loading…</div>`
                 : list.length === 0
                   ? html`<div class="muted">No issues found</div>`
-                  : html`<table
-                      class="table"
-                      role="grid"
-                      aria-rowcount=${String(list.length)}
-                      aria-colcount="8"
-                    >
-                      <colgroup>
-                        <col style="width: 100px" />
-                        <col style="width: 120px" />
-                        <col />
-                        <col style="width: 120px" />
-                        <col style="width: 160px" />
-                        <col style="width: 130px" />
-                        <col style="width: 180px" />
-                        <col style="width: 80px" />
-                      </colgroup>
-                      <thead>
-                        <tr role="row">
-                          <th role="columnheader">ID</th>
-                          <th role="columnheader">Type</th>
-                          <th role="columnheader">Title</th>
-                          <th role="columnheader">Status</th>
-                          <th role="columnheader">Assignee</th>
-                          <th
-                            role="columnheader"
-                            aria-sort=${sort_key === 'priority'
-                              ? sort_direction === 'asc'
-                                ? 'ascending'
-                                : 'descending'
-                              : 'none'}
-                          >
-                            <button
-                              type="button"
-                              class="sort-header"
-                              @click=${() => toggleSort('priority')}
-                            >
-                              Priority
-                            </button>
-                          </th>
-                          <th
-                            role="columnheader"
-                            aria-sort=${sort_key === 'updated'
-                              ? sort_direction === 'asc'
-                                ? 'ascending'
-                                : 'descending'
-                              : 'none'}
-                          >
-                            <button
-                              type="button"
-                              class="sort-header"
-                              @click=${() => toggleSort('updated')}
-                            >
-                              Updated
-                            </button>
-                          </th>
-                          <th role="columnheader">Deps</th>
-                        </tr>
-                      </thead>
-                      <tbody role="rowgroup">
-                        ${list.map((it) => renderRow(it))}
-                      </tbody>
-                    </table>`}
+                  : html`<div class="issues-table-scroll">
+                      <table
+                        class="table epics-children-table"
+                        style=${`width: ${tableWidth()}px`}
+                        role="grid"
+                        aria-rowcount=${String(list.length)}
+                        aria-colcount="8"
+                      >
+                        <colgroup>
+                          ${EPIC_COLUMNS.map(
+                            (column) =>
+                              html`<col
+                                data-epic-column=${column.key}
+                                style=${`width: ${column_widths[column.key]}px`}
+                              />`
+                          )}
+                        </colgroup>
+                        <thead>
+                          <tr role="row">
+                            ${EPIC_COLUMNS.map(columnHeader)}
+                          </tr>
+                        </thead>
+                        <tbody role="rowgroup">
+                          ${list.map((it) => renderRow(it))}
+                        </tbody>
+                      </table>
+                    </div>`}
             </div>`
           : null}
       </div>
