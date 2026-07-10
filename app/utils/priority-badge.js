@@ -40,16 +40,16 @@ export function emojiForPriority(p) {
 function priorityPrefix(p) {
   switch (p) {
     case 0:
-      return 'P0';
+      return '🔥 P0';
     case 1:
-      return 'P1';
+      return '⚡️ P1';
     case 2:
-      return 'P2';
+      return '🔧 P2';
     case 3:
-      return 'P3';
+      return '🪶 P3';
     case 4:
-      return 'P4';
+      return '💤 P4';
     default:
-      return 'P2';
+      return '🔧 P2';
   }
 }

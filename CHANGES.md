@@ -41,6 +41,8 @@
 - Improve keyboard editing focus and add accessible names, selection state, and
   sorting metadata to issue tables.
 - Add discoverable keyboard-shortcut help and slash-to-focus Issues search.
+- Show priorities consistently as rounded, color-coded badges with emoji,
+  P-number, and label values.
 - Render large Issues results progressively in 200-row segments while applying
   search, filters, and sorting to the complete loaded result first.
 - Print the reusable server URL after `bdui start` or `bdui restart` connects to

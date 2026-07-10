@@ -1,4 +1,5 @@
 import { ISSUE_TYPES, typeLabel } from '../utils/issue-type.js';
+import { emojiForPriority } from '../utils/priority-badge.js';
 import { priority_levels } from '../utils/priority.js';
 
 /**
@@ -105,7 +106,7 @@ export function createNewIssueDialog(mount_element, sendFn, router, store) {
       const o = document.createElement('option');
       o.value = String(i);
       const label = priority_levels[i] || 'Medium';
-      o.textContent = `${i} – ${label}`;
+      o.textContent = `${emojiForPriority(i)} ${label}`;
       sel_priority.appendChild(o);
     }
   }
