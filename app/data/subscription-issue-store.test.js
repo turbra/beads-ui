@@ -391,6 +391,163 @@ describe('subscription issue store', () => {
     expect(sort).toHaveBeenCalledTimes(1);
   });
 
+  test('applies a delta atomically with one notification and identity preservation', async () => {
+    const sort = vi.fn((a, b) => a.id.localeCompare(b.id));
+    const store = createSubscriptionIssueStore('s1', { sort });
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 1,
+      issues: [
+        {
+          id: 'A',
+          title: 'A1',
+          comments: [{ text: 'kept' }],
+          comment_count: 1,
+          updated_at: 100
+        },
+        { id: 'B', title: 'B1', updated_at: 100 }
+      ]
+    });
+    await flushMicrotasks();
+    sort.mockClear();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    const original = store.getById('A');
+
+    const result = store.applyPush({
+      type: 'delta',
+      id: 's1',
+      revision: 2,
+      upserts: [
+        { id: 'A', title: 'A2', updated_at: 200 },
+        { id: 'C', title: 'C1', updated_at: 100 }
+      ],
+      deletes: ['B']
+    });
+
+    expect(result).toBe('applied');
+    expect(listener).not.toHaveBeenCalled();
+    expect(store.getById('A')).toBe(original);
+    expect(store.getById('A')?.comments).toEqual([{ text: 'kept' }]);
+    expect(store.getById('A')?.comment_count).toBe(1);
+    await flushMicrotasks();
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(store.snapshot().map((issue) => issue.id)).toEqual(['A', 'C']);
+    expect(sort).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    { upserts: [{ id: 'A' }], deletes: [] },
+    { upserts: 'not-an-array', deletes: ['B', 'C'] },
+    { upserts: [{ id: 'A' }, { id: 'A' }], deletes: [] },
+    { upserts: [{ id: 'A' }], deletes: ['A'] },
+    { upserts: [{ id: '' }], deletes: ['B'] },
+    { upserts: [{ id: 'A' }], deletes: ['', 'B'] },
+    { upserts: [{ id: 'A' }], deletes: ['B', 'B'] }
+  ])('rejects malformed delta without partial state: %o', async (delta) => {
+    const store = createSubscriptionIssueStore('s1');
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 1,
+      issues: [{ id: 'A', title: 'original', updated_at: 100 }]
+    });
+    await flushMicrotasks();
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    const result = store.applyPush(
+      /** @type {any} */ ({
+        type: 'delta',
+        id: 's1',
+        revision: 2,
+        ...delta
+      })
+    );
+
+    expect(result).toBe('resync-needed');
+    expect(store.snapshot().map((issue) => issue.id)).toEqual(['A']);
+    expect(store.getById('A')?.title).toBe('original');
+    await flushMicrotasks();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  test('ignores stale delta without entering resync', () => {
+    const store = createSubscriptionIssueStore('s1');
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 5,
+      issues: [{ id: 'A', updated_at: 100 }]
+    });
+
+    const stale = store.applyPush({
+      type: 'delta',
+      id: 's1',
+      revision: 4,
+      upserts: [],
+      deletes: []
+    });
+    const next = store.applyPush({
+      type: 'upsert',
+      id: 's1',
+      revision: 6,
+      issue: { id: 'B', updated_at: 100 }
+    });
+
+    expect(stale).toBe('ignored');
+    expect(next).toBe('applied');
+    expect(store.getById('B')).toBeDefined();
+  });
+
+  test('blocks incrementals after invalid delta until a fresh snapshot', () => {
+    const store = createSubscriptionIssueStore('s1');
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 1,
+      issues: [{ id: 'A', updated_at: 100 }]
+    });
+
+    expect(
+      store.applyPush({
+        type: 'delta',
+        id: 's1',
+        revision: 2,
+        upserts: [{ id: 'B' }],
+        deletes: []
+      })
+    ).toBe('resync-needed');
+    expect(
+      store.applyPush({
+        type: 'upsert',
+        id: 's1',
+        revision: 3,
+        issue: { id: 'B', updated_at: 100 }
+      })
+    ).toBe('ignored');
+    expect(store.getById('B')).toBeUndefined();
+
+    expect(
+      store.applyPush({
+        type: 'snapshot',
+        id: 's1',
+        revision: 4,
+        issues: [{ id: 'C', updated_at: 100 }]
+      })
+    ).toBe('applied');
+    expect(
+      store.applyPush({
+        type: 'upsert',
+        id: 's1',
+        revision: 5,
+        issue: { id: 'D', updated_at: 100 }
+      })
+    ).toBe('applied');
+    expect(store.snapshot().map((issue) => issue.id)).toEqual(['C', 'D']);
+  });
+
   test('dispose clears listeners and state', async () => {
     const store = createSubscriptionIssueStore('s1');
     let hit = 0;
@@ -410,5 +567,35 @@ describe('subscription issue store', () => {
 
     expect(hit).toBe(0);
     expect(store.size()).toBe(0);
+  });
+
+  test('retains exact snapshot truncation metadata', () => {
+    const store = createSubscriptionIssueStore('s1');
+
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 1,
+      issues: [],
+      truncated: true
+    });
+    expect(store.truncation()).toBe(true);
+
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 2,
+      issues: [],
+      truncated: false
+    });
+    expect(store.truncation()).toBe(false);
+
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 3,
+      issues: []
+    });
+    expect(store.truncation()).toBeNull();
   });
 });

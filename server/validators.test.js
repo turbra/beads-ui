@@ -99,6 +99,30 @@ describe('validateSubscribeListPayload capability boundary', () => {
 });
 
 describe('validateSubscribeListPayload param allowlists', () => {
+  test('accepts the Issues-specific Ready type without params', () => {
+    const result = validateSubscribeListPayload({
+      id: 'issues',
+      type: 'issues-ready'
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      id: 'issues',
+      capabilities: [],
+      spec: { type: 'issues-ready', params: undefined }
+    });
+  });
+
+  test('rejects client-controlled Issues Ready params', () => {
+    const result = validateSubscribeListPayload({
+      id: 'issues',
+      type: 'issues-ready',
+      params: { limit: 5000 }
+    });
+
+    expect(result.ok).toBe(false);
+  });
+
   test('rejects extra issue-detail params', () => {
     const result = validateSubscribeListPayload({
       id: 'detail',

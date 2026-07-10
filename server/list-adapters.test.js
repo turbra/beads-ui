@@ -1,8 +1,12 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { runBdJson } from './bd.js';
 import {
+  BOARD_SUBSCRIPTION_LIST_LIMIT,
+  ISSUES_SUBSCRIPTION_LIST_HARD_MAX,
+  ISSUES_SUBSCRIPTION_LIST_LIMIT,
   fetchListForSubscription,
-  mapSubscriptionToBdArgs
+  mapSubscriptionToBdArgs,
+  subscriptionListLimit
 } from './list-adapters.js';
 
 vi.mock('./bd.js', () => ({ runBdJson: vi.fn() }));
@@ -10,6 +14,15 @@ vi.mock('./bd.js', () => ({ runBdJson: vi.fn() }));
 describe('list adapters for subscription types', () => {
   beforeEach(() => {
     /** @type {import('vitest').Mock} */ (runBdJson).mockReset();
+  });
+
+  test('keeps bounded Issues and Board ceiling policies independent', () => {
+    const issues_limit = subscriptionListLimit({ type: 'issues-ready' });
+    const board_limit = subscriptionListLimit({ type: 'ready-issues' });
+
+    expect(issues_limit).toBe(ISSUES_SUBSCRIPTION_LIST_LIMIT);
+    expect(board_limit).toBe(BOARD_SUBSCRIPTION_LIST_LIMIT);
+    expect(issues_limit).toBeLessThanOrEqual(ISSUES_SUBSCRIPTION_LIST_HARD_MAX);
   });
 
   test('mapSubscriptionToBdArgs returns args for all-issues', () => {
@@ -30,6 +43,12 @@ describe('list adapters for subscription types', () => {
 
   test('mapSubscriptionToBdArgs returns args for ready-issues', () => {
     const args = mapSubscriptionToBdArgs({ type: 'ready-issues' });
+    expect(args).toEqual(['ready', '--limit', '1001', '--json']);
+  });
+
+  test('mapSubscriptionToBdArgs returns args for issues-ready', () => {
+    const args = mapSubscriptionToBdArgs({ type: 'issues-ready' });
+
     expect(args).toEqual(['ready', '--limit', '1001', '--json']);
   });
 

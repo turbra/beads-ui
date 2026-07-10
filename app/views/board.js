@@ -1,7 +1,7 @@
 import { html, render } from 'lit-html';
 import { repeat } from 'lit-html/directives/repeat.js';
 import { createListSelectors } from '../data/list-selectors.js';
-import { cmpClosedDesc, cmpPriorityThenCreated } from '../data/sort.js';
+import { cmpClosedDesc } from '../data/sort.js';
 import { createIssueIdRenderer } from '../utils/issue-id-renderer.js';
 import { debug } from '../utils/logging.js';
 import { createPriorityBadge } from '../utils/priority-badge.js';
@@ -49,20 +49,16 @@ const BOARD_CLIENT_IDS = [
  * - Closed: closed_at desc.
  *
  * @param {HTMLElement} mount_element
- * @param {unknown} _data - Unused (legacy param retained for call-compat)
  * @param {(id: string) => void} gotoIssue - Navigate to issue detail.
  * @param {{ getState: () => any, setState: (patch: any) => void, subscribe?: (fn: (s:any)=>void)=>()=>void }} [store]
- * @param {{ selectors: { getIds: (client_id: string) => string[], count?: (client_id: string) => number } }} [subscriptions]
  * @param {{ snapshotFor?: (client_id: string) => any[], subscribe?: (fn: () => void) => () => void }} [issueStores]
  * @param {(type: string, payload: unknown) => Promise<unknown>} [transport] - Transport function for sending updates
  * @returns {{ load: () => Promise<void>, clear: () => void }}
  */
 export function createBoardView(
   mount_element,
-  _data,
   gotoIssue,
   store,
-  subscriptions = undefined,
   issueStores = undefined,
   transport = undefined
 ) {
@@ -627,89 +623,8 @@ export function createBoardView(
 
   return {
     async load() {
-      // Compose lists from subscriptions + issues store
       log('load');
       refreshFromStores();
-      // If nothing is present yet (e.g., immediately after switching back
-      // to the Board and before list-delta arrives), fetch via data layer as
-      // a fallback so the board is not empty on initial display.
-      try {
-        const has_subs = Boolean(subscriptions && subscriptions.selectors);
-        /**
-         * @param {string} id
-         */
-        const cnt = (id) => {
-          if (!has_subs || !subscriptions) {
-            return 0;
-          }
-          const sel = subscriptions.selectors;
-          if (typeof sel.count === 'function') {
-            return Number(sel.count(id) || 0);
-          }
-          try {
-            const arr = sel.getIds(id);
-            return Array.isArray(arr) ? arr.length : 0;
-          } catch {
-            return 0;
-          }
-        };
-        const total_items =
-          cnt('tab:board:ready') +
-          cnt('tab:board:blocked') +
-          cnt('tab:board:in-progress') +
-          cnt('tab:board:closed');
-        const data = /** @type {any} */ (_data);
-        const can_fetch =
-          data &&
-          typeof data.getReady === 'function' &&
-          typeof data.getBlocked === 'function' &&
-          typeof data.getInProgress === 'function' &&
-          typeof data.getClosed === 'function';
-        if (total_items === 0 && can_fetch) {
-          log('fallback fetch');
-          /** @type {[IssueLite[], IssueLite[], IssueLite[], IssueLite[]]} */
-          const [ready_raw, blocked_raw, in_prog_raw, closed_raw] =
-            await Promise.all([
-              data.getReady().catch(() => []),
-              data.getBlocked().catch(() => []),
-              data.getInProgress().catch(() => []),
-              data.getClosed().catch(() => [])
-            ]);
-          // Normalize and map unknowns to IssueLite shape
-          /** @type {IssueLite[]} */
-          let ready = Array.isArray(ready_raw) ? ready_raw.map((it) => it) : [];
-          /** @type {IssueLite[]} */
-          const blocked = Array.isArray(blocked_raw)
-            ? blocked_raw.map((it) => it)
-            : [];
-          /** @type {IssueLite[]} */
-          const in_prog = Array.isArray(in_prog_raw)
-            ? in_prog_raw.map((it) => it)
-            : [];
-          /** @type {IssueLite[]} */
-          const closed = Array.isArray(closed_raw)
-            ? closed_raw.map((it) => it)
-            : [];
-
-          // Remove items from Ready that are already In Progress
-          /** @type {Set<string>} */
-          const in_progress_ids = new Set(in_prog.map((i) => i.id));
-          ready = ready.filter((i) => !in_progress_ids.has(i.id));
-
-          // Sort as per column rules
-          ready.sort(cmpPriorityThenCreated);
-          blocked.sort(cmpPriorityThenCreated);
-          in_prog.sort(cmpPriorityThenCreated);
-          list_ready = ready;
-          list_blocked = blocked;
-          list_in_progress = in_prog;
-          list_closed_raw = closed;
-          applyClosedFilter();
-          doRender();
-        }
-      } catch {
-        // ignore fallback errors
-      }
     },
     clear() {
       mount_element.replaceChildren();

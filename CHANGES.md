@@ -20,6 +20,10 @@
   after lifecycle changes.
 - Run detail, comment, dependency, label, delete, and mutation commands against
   the currently selected workspace instead of the daemon's startup directory.
+- Recover malformed subscription deltas with a fresh snapshot instead of
+  silently accepting later updates on stale state.
+- Replace blocking subscription-failure dialogs with scoped, retryable alerts
+  that preserve successfully loaded Issues, Epics, detail, and Board content.
 
 ### Enhancements
 
@@ -30,11 +34,15 @@
   fail.
 - Add Today, 3 days, and 7 days filters to the Board's Closed column.
 - Expand issue search to include IDs, titles, assignees, and labels.
-- Add sortable Priority and Updated columns to the Issues and Epics tables.
+- Add stable, accessible sorting to every Issues column and to Priority and
+  Updated in the Epics table.
 - Improve empty states with Create Issue and Clear Filters actions.
 - Render comments as sanitized Markdown with readable relative timestamps.
 - Improve keyboard editing focus and add accessible names, selection state, and
   sorting metadata to issue tables.
+- Add discoverable keyboard-shortcut help and slash-to-focus Issues search.
+- Render large Issues results progressively in 200-row segments while applying
+  search, filters, and sorting to the complete loaded result first.
 - Print the reusable server URL after `bdui start` or `bdui restart` connects to
   an already running server.
 
@@ -53,6 +61,13 @@
   snapshot, upsert, and delete compatibility.
 - Bound list snapshots to 1,000 issues with exact truncation metadata, connection
   quotas, and WebSocket frame and buffer limits.
+- Remove redundant `bd show` processes after supported field updates by using
+  canonical `bd update --json` replies with an older-CLI fallback.
+- Cache comment author lookups per workspace and remove obsolete client
+  membership state now owned by full-issue subscription stores.
+- Add deterministic 1,000/5,000/10,000 issue benchmark tooling and retain the
+  1,000-item production ceiling until real-browser and representative `bd`
+  evidence satisfies the larger-tier gates.
 
 ### Security
 

@@ -110,14 +110,7 @@ describe('views/list inline edits', () => {
       issues: current
     });
 
-    const view = createListView(
-      mount,
-      send,
-      undefined,
-      undefined,
-      undefined,
-      issueStores
-    );
+    const view = createListView(mount, send, undefined, undefined, issueStores);
     await view.load();
 
     const firstRow = /** @type {HTMLElement} */ (
@@ -160,7 +153,6 @@ describe('views/list inline edits', () => {
     const view = createListView(
       mount,
       async () => request.promise,
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -217,7 +209,6 @@ describe('views/list inline edits', () => {
       async () => request.promise,
       undefined,
       undefined,
-      undefined,
       issueStores
     );
     await view.load();
@@ -261,7 +252,6 @@ describe('views/list inline edits', () => {
     const view = createListView(
       mount,
       async () => /** @type {Promise<any>} */ (requests.shift()?.promise),
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -321,7 +311,6 @@ describe('views/list inline edits', () => {
       },
       undefined,
       undefined,
-      undefined,
       issueStores
     );
     await view.load();
@@ -366,7 +355,6 @@ describe('views/list inline edits', () => {
     const view = createListView(
       mount,
       async () => /** @type {Promise<any>} */ (requests.shift()?.promise),
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -418,7 +406,6 @@ describe('views/list inline edits', () => {
     const view = createListView(
       mount,
       async () => /** @type {Promise<any>} */ (requests.shift()?.promise),
-      undefined,
       undefined,
       undefined,
       issueStores

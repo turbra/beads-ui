@@ -5,75 +5,7 @@ import { describe, expect, test, vi } from 'vitest';
 import { createSubscriptionStore } from './subscriptions-store.js';
 
 describe('client subscription store', () => {
-  test('applies delta sequences to itemsById', async () => {
-    /** @type {(type: any, payload?: any) => Promise<any>} */
-    const send = async () => ({ ok: true });
-    const store = createSubscriptionStore(send);
-
-    const spec = { type: 'all-issues' };
-    const key = store._subKeyOf(spec);
-    const unsub = await store.subscribeList('s1', spec);
-
-    // Initial add
-    store._applyDelta(key, {
-      added: ['UI-1', 'UI-2'],
-      updated: [],
-      removed: []
-    });
-    expect(store.selectors.count('s1')).toBe(2);
-    expect(store.selectors.has('s1', 'UI-1')).toBe(true);
-    expect(store.selectors.has('s1', 'UI-2')).toBe(true);
-
-    // Update should be idempotent presence toggle (exists)
-    store._applyDelta(key, { added: [], updated: ['UI-2'], removed: [] });
-    expect(store.selectors.count('s1')).toBe(2);
-
-    // Add one, remove one
-    store._applyDelta(key, { added: ['UI-3'], updated: [], removed: ['UI-1'] });
-    const ids = store.selectors.getIds('s1').sort();
-    expect(ids).toEqual(['UI-2', 'UI-3']);
-
-    await unsub();
-  });
-
-  test('fans out deltas to multiple subscribers of same key', async () => {
-    const send = async () => ({ ok: true });
-    const store = createSubscriptionStore(send);
-    const spec = { type: 'in-progress-issues' };
-    const key = store._subKeyOf(spec);
-
-    const unsub1 = await store.subscribeList('s1', spec);
-    const unsub2 = await store.subscribeList('s2', spec);
-
-    store._applyDelta(key, { added: ['UI-10'], updated: [], removed: [] });
-    expect(store.selectors.has('s1', 'UI-10')).toBe(true);
-    expect(store.selectors.has('s2', 'UI-10')).toBe(true);
-
-    await unsub2();
-    store._applyDelta(key, { added: [], updated: [], removed: ['UI-10'] });
-    expect(store.selectors.has('s1', 'UI-10')).toBe(false);
-    // s2 unsubscribed; its local store is gone
-    expect(store.selectors.count('s2')).toBe(0);
-
-    await unsub1();
-  });
-
-  test('unsubscribe clears local store and mapping', async () => {
-    const send = async () => ({ ok: true });
-    const store = createSubscriptionStore(send);
-    const spec = { type: 'blocked-issues' };
-    const key = store._subKeyOf(spec);
-
-    const unsub = await store.subscribeList('sZ', spec);
-    store._applyDelta(key, { added: ['UI-7'], updated: [], removed: [] });
-    expect(store.selectors.count('sZ')).toBe(1);
-
-    await unsub();
-    expect(store.selectors.count('sZ')).toBe(0);
-    expect(store.selectors.getIds('sZ')).toEqual([]);
-  });
-
-  test('subscribeList rejects and cleans up on transport error', async () => {
+  test('does not replay a subscription rejected by the server', async () => {
     const send = vi.fn(async () => {
       throw { code: 'bd_error', message: 'boom', details: { exit_code: 1 } };
     });
@@ -84,9 +16,8 @@ describe('client subscription store', () => {
       message: 'boom'
     });
 
-    expect(store.selectors.count('err-1')).toBe(0);
-    expect(store.selectors.getIds('err-1')).toEqual([]);
     expect(send).toHaveBeenCalledTimes(1);
+    await expect(store.resubscribeAll()).resolves.toEqual([]);
   });
 
   test('retains a disconnected initial subscription for replay', async () => {
@@ -148,8 +79,49 @@ describe('client subscription store', () => {
     expect(send).toHaveBeenCalledWith('subscribe-list', {
       id: 'closed',
       type: 'closed-issues',
-      params: { since: 100 }
+      params: { since: 100 },
+      capabilities: ['subscription-delta-v1']
     });
+  });
+
+  test('advertises immutable delta capability on initial subscribe and replay', async () => {
+    const send = vi.fn(async () => ({ ok: true }));
+    const store = createSubscriptionStore(send);
+    const spec = {
+      type: 'closed-issues',
+      params: { since: 100 },
+      capabilities: ['caller-controlled']
+    };
+
+    await store.subscribeList('closed', spec);
+    spec.capabilities.push('mutated');
+    send.mockClear();
+    await store.resubscribeAll();
+
+    expect(send).toHaveBeenCalledWith('subscribe-list', {
+      id: 'closed',
+      type: 'closed-issues',
+      params: { since: 100 },
+      capabilities: ['subscription-delta-v1']
+    });
+  });
+
+  test('resubscribes one active subscription from its saved spec', async () => {
+    const send = vi.fn(async () => ({ ok: true }));
+    const store = createSubscriptionStore(send);
+    await store.subscribeList('ready', { type: 'ready-issues' });
+    send.mockClear();
+
+    const replayed = await store.resubscribeOne('ready');
+
+    expect(replayed).toBe(true);
+    expect(send).toHaveBeenCalledWith('subscribe-list', {
+      id: 'ready',
+      type: 'ready-issues',
+      params: undefined,
+      capabilities: ['subscription-delta-v1']
+    });
+    await expect(store.resubscribeOne('missing')).resolves.toBe(false);
   });
 
   test('attempts every replay and retains failed subscriptions', async () => {
@@ -214,16 +186,10 @@ describe('client subscription store', () => {
     const store = createSubscriptionStore(send);
     const spec = { type: 'all-issues' };
     const unsubscribe = await store.subscribeList('active', spec);
-    const key = store._subKeyOf(spec);
-    store._applyDelta(key, {
-      added: ['UI-1'],
-      updated: [],
-      removed: []
-    });
 
     const pending_unsubscribe = unsubscribe();
 
-    expect(store.selectors.count('active')).toBe(0);
+    await expect(store.resubscribeOne('active')).resolves.toBe(false);
     resolve_unsubscribe();
     await pending_unsubscribe;
   });

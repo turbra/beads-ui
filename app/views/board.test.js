@@ -152,11 +152,9 @@ describe('views/board', () => {
     const navigations = [];
     const view = createBoardView(
       mount,
-      null,
       (id) => {
         navigations.push(id);
       },
-      undefined,
       undefined,
       issueStores
     );
@@ -279,14 +277,7 @@ describe('views/board', () => {
       ]
     });
 
-    const view = createBoardView(
-      mount,
-      null,
-      () => {},
-      undefined,
-      undefined,
-      issueStores
-    );
+    const view = createBoardView(mount, () => {}, undefined, issueStores);
 
     await view.load();
 
@@ -350,14 +341,7 @@ describe('views/board', () => {
       issues: issues.filter((i) => i.id.startsWith('X-2'))
     });
 
-    const view = createBoardView(
-      mount,
-      null,
-      () => {},
-      undefined,
-      undefined,
-      issueStores
-    );
+    const view = createBoardView(mount, () => {}, undefined, issueStores);
 
     await view.load();
 

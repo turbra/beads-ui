@@ -86,6 +86,97 @@ describe('ws mutation handlers', () => {
     expect(obj.payload.status).toBe('in_progress');
   });
 
+  test('uses one JSON process for current update output', async () => {
+    const mRun = /** @type {import('vitest').Mock} */ (runBd);
+    const mJson = /** @type {import('vitest').Mock} */ (runBdJson);
+    mJson.mockResolvedValueOnce({
+      code: 0,
+      stdoutJson: [{ id: 'UI-7', status: 'closed' }]
+    });
+    const ws = makeStubSocket();
+
+    await handleMessage(
+      /** @type {any} */ (ws),
+      Buffer.from(
+        JSON.stringify({
+          id: 'json-update',
+          type: 'update-status',
+          payload: { id: 'UI-7', status: 'closed' }
+        })
+      )
+    );
+
+    expect(mJson).toHaveBeenCalledTimes(1);
+    expect(mJson).toHaveBeenCalledWith(
+      ['update', 'UI-7', '--status', 'closed', '--json'],
+      { cwd: undefined }
+    );
+    expect(mRun).not.toHaveBeenCalled();
+    expect(JSON.parse(ws.sent.at(-1) || '{}').payload).toEqual({
+      id: 'UI-7',
+      status: 'closed'
+    });
+  });
+
+  test('falls back when an older bd rejects update JSON output', async () => {
+    const mRun = /** @type {import('vitest').Mock} */ (runBd);
+    const mJson = /** @type {import('vitest').Mock} */ (runBdJson);
+    mJson
+      .mockResolvedValueOnce({ code: 1, stderr: 'unknown flag: --json' })
+      .mockResolvedValueOnce({
+        code: 0,
+        stdoutJson: { id: 'UI-7', status: 'closed' }
+      });
+    mRun.mockResolvedValueOnce({ code: 0, stdout: '', stderr: '' });
+    const ws = makeStubSocket();
+
+    await handleMessage(
+      /** @type {any} */ (ws),
+      Buffer.from(
+        JSON.stringify({
+          id: 'legacy-update',
+          type: 'update-status',
+          payload: { id: 'UI-7', status: 'closed' }
+        })
+      )
+    );
+
+    expect(mRun).toHaveBeenCalledWith(
+      ['update', 'UI-7', '--status', 'closed'],
+      { cwd: undefined }
+    );
+    expect(mJson.mock.calls.map(([args]) => args)).toEqual([
+      ['update', 'UI-7', '--status', 'closed', '--json'],
+      ['show', 'UI-7', '--json']
+    ]);
+    expect(JSON.parse(ws.sent.at(-1) || '{}').payload.status).toBe('closed');
+  });
+
+  test('does not retry genuine update failures', async () => {
+    const mRun = /** @type {import('vitest').Mock} */ (runBd);
+    const mJson = /** @type {import('vitest').Mock} */ (runBdJson);
+    mJson.mockResolvedValueOnce({ code: 1, stderr: 'issue not found' });
+    const ws = makeStubSocket();
+
+    await handleMessage(
+      /** @type {any} */ (ws),
+      Buffer.from(
+        JSON.stringify({
+          id: 'failed-update',
+          type: 'update-status',
+          payload: { id: 'UI-missing', status: 'closed' }
+        })
+      )
+    );
+
+    expect(mJson).toHaveBeenCalledTimes(1);
+    expect(mRun).not.toHaveBeenCalled();
+    expect(JSON.parse(ws.sent.at(-1) || '{}').error).toEqual({
+      code: 'bd_error',
+      message: 'issue not found'
+    });
+  });
+
   test('update-status invalid payload yields bad_request', async () => {
     const ws = makeStubSocket();
     const req = {
@@ -181,7 +272,7 @@ describe('ws mutation handlers', () => {
       /** @type {any} */ (ws),
       Buffer.from(JSON.stringify(req))
     );
-    const call = mRun.mock.calls[mRun.mock.calls.length - 1];
+    const call = mJson.mock.calls[mJson.mock.calls.length - 1];
     expect(call[0][0]).toBe('update');
     expect(call[0].includes('--assignee')).toBe(true);
     const obj = JSON.parse(ws.sent[ws.sent.length - 1]);
@@ -204,8 +295,8 @@ describe('ws mutation handlers', () => {
       /** @type {any} */ (ws),
       Buffer.from(JSON.stringify(req))
     );
-    const call = mRun.mock.calls[mRun.mock.calls.length - 1];
-    expect(call[0]).toEqual(['update', 'UI-31', '--assignee', '']);
+    const call = mJson.mock.calls[mJson.mock.calls.length - 1];
+    expect(call[0]).toEqual(['update', 'UI-31', '--assignee', '', '--json']);
     const obj = JSON.parse(ws.sent[ws.sent.length - 1]);
     expect(obj.ok).toBe(true);
     expect(obj.payload.id).toBe('UI-31');
@@ -233,11 +324,12 @@ describe('ws mutation handlers', () => {
     expect(obj.ok).toBe(true);
     expect(obj.payload.acceptance).toBe('Done when...');
     // Verify correct flag mapping for acceptance
-    expect(mRun.mock.calls[0][0]).toEqual([
+    expect(mJson.mock.calls[0][0]).toEqual([
       'update',
       'UI-7',
       '--acceptance-criteria',
-      'Done when...'
+      'Done when...',
+      '--json'
     ]);
   });
 
@@ -263,11 +355,12 @@ describe('ws mutation handlers', () => {
     expect(obj.ok).toBe(true);
     expect(obj.payload.notes).toBe('Some note');
     // Verify correct flag mapping for notes
-    expect(mRun.mock.calls[0][0]).toEqual([
+    expect(mJson.mock.calls[0][0]).toEqual([
       'update',
       'UI-12',
       '--notes',
-      'Some note'
+      'Some note',
+      '--json'
     ]);
   });
 
@@ -290,8 +383,14 @@ describe('ws mutation handlers', () => {
       Buffer.from(JSON.stringify(req))
     );
     // Verify bd call flag mapping
-    const call = mRun.mock.calls[mRun.mock.calls.length - 1][0];
-    expect(call).toEqual(['update', 'UI-7', '--description', 'New desc']);
+    const call = mJson.mock.calls[mJson.mock.calls.length - 1][0];
+    expect(call).toEqual([
+      'update',
+      'UI-7',
+      '--description',
+      'New desc',
+      '--json'
+    ]);
     const obj = JSON.parse(ws.sent[ws.sent.length - 1]);
     expect(obj.ok).toBe(true);
     expect(obj.payload.description).toBe('New desc');
@@ -315,8 +414,14 @@ describe('ws mutation handlers', () => {
       /** @type {any} */ (ws),
       Buffer.from(JSON.stringify(req))
     );
-    const call = mRun.mock.calls[mRun.mock.calls.length - 1][0];
-    expect(call).toEqual(['update', 'UI-8', '--design', 'New design']);
+    const call = mJson.mock.calls[mJson.mock.calls.length - 1][0];
+    expect(call).toEqual([
+      'update',
+      'UI-8',
+      '--design',
+      'New design',
+      '--json'
+    ]);
     const obj = JSON.parse(ws.sent[ws.sent.length - 1]);
     expect(obj.ok).toBe(true);
     expect(obj.payload.design).toBe('New design');
@@ -400,13 +505,11 @@ describe('ws mutation handlers', () => {
       )
     );
 
-    expect(mRun).toHaveBeenLastCalledWith(
-      ['update', 'UI-7', '--status', 'closed'],
+    expect(mJson).toHaveBeenLastCalledWith(
+      ['update', 'UI-7', '--status', 'closed', '--json'],
       { cwd: root_dir }
     );
-    expect(mJson).toHaveBeenLastCalledWith(['show', 'UI-7', '--json'], {
-      cwd: root_dir
-    });
+    expect(mRun).not.toHaveBeenCalled();
   });
 
   test('add-comment uses selected workspace for author, mutation, and reload', async () => {

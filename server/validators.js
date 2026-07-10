@@ -34,6 +34,7 @@ const SUBSCRIPTION_TYPES = new Set([
   'all-issues',
   'epics',
   'blocked-issues',
+  'issues-ready',
   'ready-issues',
   'in-progress-issues',
   'status-issues',

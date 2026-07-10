@@ -81,7 +81,6 @@ describe('views/list navigation', () => {
       async () => [],
       undefined,
       undefined,
-      undefined,
       issueStores
     );
     await view.load();
@@ -146,7 +145,6 @@ describe('views/list navigation', () => {
       async () => [],
       undefined,
       undefined,
-      undefined,
       issueStores
     );
     await view.load();
@@ -200,7 +198,6 @@ describe('views/list navigation', () => {
       async () => [],
       undefined,
       undefined,
-      undefined,
       issueStores
     );
     await view.load();
@@ -249,7 +246,6 @@ describe('views/list navigation', () => {
     const view = createListView(
       mount,
       async () => [],
-      undefined,
       undefined,
       undefined,
       issueStores

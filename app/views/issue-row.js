@@ -376,6 +376,10 @@ export function createIssueRowRenderer(options) {
               >${(it.dependency_count || 0) > 0
                 ? html`<span
                     class="dep-count"
+                    aria-label="${it.dependency_count} ${(it.dependency_count ||
+                      0) === 1
+                      ? 'dependency'
+                      : 'dependencies'}"
                     title="${it.dependency_count} ${(it.dependency_count ||
                       0) === 1
                       ? 'dependency'
@@ -385,6 +389,10 @@ export function createIssueRowRenderer(options) {
                 : ''}${(it.dependent_count || 0) > 0
                 ? html`<span
                     class="dependent-count"
+                    aria-label="${it.dependent_count} ${(it.dependent_count ||
+                      0) === 1
+                      ? 'dependent'
+                      : 'dependents'}"
                     title="${it.dependent_count} ${(it.dependent_count || 0) ===
                     1
                       ? 'dependent'

@@ -872,6 +872,80 @@ function selectedWorkspaceBdOptions(options = {}) {
 }
 
 /**
+ * Extract one canonical issue object from `bd update --json` or `bd show`
+ * output. Current bd returns update results as a one-item array while older
+ * versions may return the object directly.
+ *
+ * @param {unknown} value
+ * @param {string} issue_id
+ */
+function extractCanonicalIssue(value, issue_id) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return String(/** @type {any} */ (value).id || '') === issue_id
+      ? value
+      : null;
+  }
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  return (
+    value.find(
+      (issue) =>
+        issue &&
+        typeof issue === 'object' &&
+        String(/** @type {any} */ (issue).id || '') === issue_id
+    ) || null
+  );
+}
+
+/**
+ * @param {string | undefined} stderr
+ */
+function rejectsJsonFlag(stderr) {
+  const message = String(stderr || '');
+  return (
+    /(?:unknown|unrecognized|unsupported).*(?:flag|option).*--json/i.test(
+      message
+    ) || /--json.*(?:unknown|unrecognized|unsupported)/i.test(message)
+  );
+}
+
+/**
+ * Run a field update and return its canonical issue while retaining a bounded
+ * compatibility path for bd versions that do not support update JSON output.
+ *
+ * @param {string[]} args
+ * @param {string} issue_id
+ * @param {{ cwd?: string, priority?: 'interactive' | 'background' }} options
+ * @returns {Promise<{ code: number, stdoutJson?: unknown, stderr?: string }>}
+ */
+async function runCanonicalUpdate(args, issue_id, options) {
+  const json_result = await runBdJson([...args, '--json'], options);
+  if (json_result.code === 0) {
+    const issue = extractCanonicalIssue(json_result.stdoutJson, issue_id);
+    if (issue) {
+      return { code: 0, stdoutJson: issue };
+    }
+  } else if (!rejectsJsonFlag(json_result.stderr)) {
+    return json_result;
+  } else {
+    const legacy_result = await runBd(args, options);
+    if (legacy_result.code !== 0) {
+      return legacy_result;
+    }
+  }
+
+  const shown = await runBdJson(['show', issue_id, '--json'], options);
+  if (shown.code !== 0) {
+    return shown;
+  }
+  const issue = extractCanonicalIssue(shown.stdoutJson, issue_id);
+  return issue
+    ? { code: 0, stdoutJson: issue }
+    : { code: 1, stderr: 'bd returned no canonical issue' };
+}
+
+/**
  * @param {string} issue_id
  */
 function issueDetailCacheKey(issue_id) {
@@ -1660,21 +1734,18 @@ export async function handleMessage(ws, data) {
     // Pass empty string to clear assignee when requested
     clearDetailCaches();
     const bd_options = selectedWorkspaceBdOptions();
-    const res = await runBd(['update', id, '--assignee', assignee], bd_options);
+    const res = await runCanonicalUpdate(
+      ['update', id, '--assignee', assignee],
+      id,
+      bd_options
+    );
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json'], bd_options);
-    if (shown.code !== 0) {
-      ws.send(
-        JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
-      );
-      return;
-    }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, res.stdoutJson)));
     try {
       triggerMutationRefreshOnce();
     } catch {
@@ -1707,21 +1778,18 @@ export async function handleMessage(ws, data) {
     }
     clearDetailCaches();
     const bd_options = selectedWorkspaceBdOptions();
-    const res = await runBd(['update', id, '--status', status], bd_options);
+    const res = await runCanonicalUpdate(
+      ['update', id, '--status', status],
+      id,
+      bd_options
+    );
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json'], bd_options);
-    if (shown.code !== 0) {
-      ws.send(
-        JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
-      );
-      return;
-    }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, res.stdoutJson)));
     // After mutation, refresh active subscriptions once (watcher or timeout)
     try {
       triggerMutationRefreshOnce();
@@ -1755,8 +1823,9 @@ export async function handleMessage(ws, data) {
     }
     clearDetailCaches();
     const bd_options = selectedWorkspaceBdOptions();
-    const res = await runBd(
+    const res = await runCanonicalUpdate(
       ['update', id, '--priority', String(priority)],
+      id,
       bd_options
     );
     if (res.code !== 0) {
@@ -1765,14 +1834,7 @@ export async function handleMessage(ws, data) {
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json'], bd_options);
-    if (shown.code !== 0) {
-      ws.send(
-        JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
-      );
-      return;
-    }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, res.stdoutJson)));
     try {
       triggerMutationRefreshOnce();
     } catch {
@@ -1824,21 +1886,18 @@ export async function handleMessage(ws, data) {
               : '--design';
     clearDetailCaches();
     const bd_options = selectedWorkspaceBdOptions();
-    const res = await runBd(['update', id, flag, value], bd_options);
+    const res = await runCanonicalUpdate(
+      ['update', id, flag, value],
+      id,
+      bd_options
+    );
     if (res.code !== 0) {
       ws.send(
         JSON.stringify(makeError(req, 'bd_error', res.stderr || 'bd failed'))
       );
       return;
     }
-    const shown = await runBdJson(['show', id, '--json'], bd_options);
-    if (shown.code !== 0) {
-      ws.send(
-        JSON.stringify(makeError(req, 'bd_error', shown.stderr || 'bd failed'))
-      );
-      return;
-    }
-    ws.send(JSON.stringify(makeOk(req, shown.stdoutJson)));
+    ws.send(JSON.stringify(makeOk(req, res.stdoutJson)));
     try {
       triggerMutationRefreshOnce();
     } catch {

@@ -41,6 +41,10 @@ export function createSubscriptionIssueStore(id, options = {}) {
   let emit_scheduled = false;
   /** @type {boolean} */
   let ordered_dirty = false;
+  /** @type {boolean} */
+  let needs_resync = false;
+  /** @type {boolean | null} */
+  let truncation = null;
   /** @type {(a:any,b:any)=>number} */
   const sort = options.sort || cmpPriorityThenCreated;
 
@@ -98,29 +102,132 @@ export function createSubscriptionIssueStore(id, options = {}) {
   }
 
   /**
-   * Apply snapshot/upsert/delete in revision order. Snapshots reset state.
+   * Apply one validated issue while preserving existing object identity and
+   * client-side comment enrichment.
+   *
+   * @param {any} issue
+   */
+  function applyIssue(issue) {
+    const existing = items_by_id.get(issue.id);
+    if (!existing) {
+      items_by_id.set(issue.id, issue);
+      return;
+    }
+    const previous_timestamp = Number.isFinite(existing.updated_at)
+      ? /** @type {number} */ (existing.updated_at)
+      : 0;
+    const next_timestamp = Number.isFinite(issue.updated_at)
+      ? /** @type {number} */ (issue.updated_at)
+      : 0;
+    if (previous_timestamp > next_timestamp) {
+      return;
+    }
+    const preserve_comments =
+      !hasOwn(issue, 'comments') && hasOwn(existing, 'comments');
+    const previous_comments = preserve_comments ? existing.comments : undefined;
+    const preserve_comment_count =
+      !hasOwn(issue, 'comment_count') && hasOwn(existing, 'comment_count');
+    const previous_comment_count = preserve_comment_count
+      ? existing.comment_count
+      : undefined;
+    for (const key of Object.keys(existing)) {
+      if (!(key in issue)) {
+        delete existing[key];
+      }
+    }
+    for (const [key, value] of Object.entries(issue)) {
+      // @ts-ignore - dynamic assignment
+      existing[key] = value;
+    }
+    if (preserve_comments) {
+      existing.comments = previous_comments;
+    }
+    if (preserve_comment_count) {
+      existing.comment_count = previous_comment_count;
+    }
+  }
+
+  /**
+   * Validate the complete delta before any local state changes are made.
+   *
+   * @param {any} msg
+   * @returns {boolean}
+   */
+  function isValidDelta(msg) {
+    if (!Array.isArray(msg.upserts) || !Array.isArray(msg.deletes)) {
+      return false;
+    }
+    if (msg.upserts.length + msg.deletes.length < 2) {
+      return false;
+    }
+    /** @type {Set<string>} */
+    const upsert_ids = new Set();
+    for (const issue of msg.upserts) {
+      if (
+        !issue ||
+        typeof issue !== 'object' ||
+        Array.isArray(issue) ||
+        typeof issue.id !== 'string' ||
+        issue.id.length === 0 ||
+        upsert_ids.has(issue.id)
+      ) {
+        return false;
+      }
+      upsert_ids.add(issue.id);
+    }
+    /** @type {Set<string>} */
+    const delete_ids = new Set();
+    for (const issue_id of msg.deletes) {
+      if (
+        typeof issue_id !== 'string' ||
+        issue_id.length === 0 ||
+        delete_ids.has(issue_id) ||
+        upsert_ids.has(issue_id)
+      ) {
+        return false;
+      }
+      delete_ids.add(issue_id);
+    }
+    return true;
+  }
+
+  /** @returns {'ignored'|'resync-needed'} */
+  function markResyncNeeded() {
+    if (needs_resync) {
+      return 'ignored';
+    }
+    needs_resync = true;
+    return 'resync-needed';
+  }
+
+  /**
+   * Apply snapshot/upsert/delete/delta in revision order. Snapshots reset state.
    * - Ignore messages with revision <= last_revision (except snapshot which resets first).
    * - Preserve object identity when updating an existing item by mutating
    *   fields in place rather than replacing the object reference.
    *
-   * @param {{ type: 'snapshot'|'upsert'|'delete', id: string, revision: number, issues?: any[], issue?: any, issue_id?: string }} msg
+   * @param {{ type: 'snapshot'|'upsert'|'delete'|'delta', id: string, revision: number, issues?: any[], issue?: any, issue_id?: string, upserts?: any[], deletes?: string[], truncated?: boolean }} msg
+   * @returns {'applied'|'ignored'|'resync-needed'}
    */
   function applyPush(msg) {
     if (is_disposed) {
-      return;
+      return 'ignored';
     }
     if (!msg || msg.id !== id) {
-      return;
+      return 'ignored';
     }
-    const rev = Number(msg.revision) || 0;
+    const rev = msg.revision;
     log('apply %s rev=%d', msg.type, rev);
+    if (!Number.isSafeInteger(rev) || rev <= 0) {
+      return msg.type === 'delta' ? markResyncNeeded() : 'ignored';
+    }
     // Ignore stale messages for all types, including snapshots
     if (rev <= last_revision && msg.type !== 'snapshot') {
-      return; // stale or duplicate non-snapshot
+      return 'ignored'; // stale or duplicate non-snapshot
     }
     if (msg.type === 'snapshot') {
       if (rev <= last_revision) {
-        return; // ignore stale snapshot
+        return 'ignored'; // ignore stale snapshot
       }
       const previous_items = new Map(items_by_id);
       items_by_id.clear();
@@ -133,53 +240,23 @@ export function createSubscriptionIssueStore(id, options = {}) {
       }
       ordered_dirty = true;
       last_revision = rev;
+      needs_resync = false;
+      truncation = typeof msg.truncated === 'boolean' ? msg.truncated : null;
       scheduleEmit();
-      return;
+      return 'applied';
+    }
+    if (needs_resync) {
+      return 'ignored';
     }
     if (msg.type === 'upsert') {
       const it = msg.issue;
       if (it && typeof it.id === 'string' && it.id.length > 0) {
-        const existing = items_by_id.get(it.id);
-        if (!existing) {
-          items_by_id.set(it.id, it);
-          ordered_dirty = true;
-        } else {
-          // Guard with updated_at; prefer newer
-          const prev_ts = Number.isFinite(existing.updated_at)
-            ? /** @type {number} */ (existing.updated_at)
-            : 0;
-          const next_ts = Number.isFinite(it.updated_at)
-            ? /** @type {number} */ (it.updated_at)
-            : 0;
-          if (prev_ts <= next_ts) {
-            const has_incoming_comments = hasOwn(it, 'comments');
-            const preserve_comments =
-              !has_incoming_comments && hasOwn(existing, 'comments');
-            const previous_comments = preserve_comments
-              ? existing.comments
-              : undefined;
-            // Mutate existing object to preserve reference
-            for (const k of Object.keys(existing)) {
-              if (!(k in it)) {
-                // remove keys that disappeared to avoid stale fields
-                delete existing[k];
-              }
-            }
-            for (const [k, v] of Object.entries(it)) {
-              // @ts-ignore - dynamic assignment
-              existing[k] = v;
-            }
-            if (preserve_comments) {
-              existing.comments = previous_comments;
-            }
-            ordered_dirty = true;
-          } else {
-            // stale by timestamp; ignore
-          }
-        }
+        applyIssue(it);
+        ordered_dirty = true;
       }
       last_revision = rev;
       scheduleEmit();
+      return 'applied';
     } else if (msg.type === 'delete') {
       const rid = String(msg.issue_id || '');
       if (rid) {
@@ -187,7 +264,23 @@ export function createSubscriptionIssueStore(id, options = {}) {
       }
       last_revision = rev;
       scheduleEmit();
+      return 'applied';
+    } else if (msg.type === 'delta') {
+      if (!isValidDelta(msg)) {
+        return markResyncNeeded();
+      }
+      for (const issue of msg.upserts || []) {
+        applyIssue(issue);
+      }
+      for (const issue_id of msg.deletes || []) {
+        items_by_id.delete(issue_id);
+      }
+      ordered_dirty = true;
+      last_revision = rev;
+      scheduleEmit();
+      return 'applied';
     }
+    return 'ignored';
   }
 
   /**
@@ -239,11 +332,15 @@ export function createSubscriptionIssueStore(id, options = {}) {
       };
     },
     applyPush,
+    requireResync: markResyncNeeded,
     seed,
     snapshot() {
       // Return as read-only view; callers must not mutate
       ensureOrdered();
       return ordered;
+    },
+    truncation() {
+      return truncation;
     },
     size() {
       return items_by_id.size;
@@ -262,6 +359,8 @@ export function createSubscriptionIssueStore(id, options = {}) {
       ordered_dirty = false;
       listeners.clear();
       last_revision = 0;
+      needs_resync = false;
+      truncation = null;
     }
   };
 }

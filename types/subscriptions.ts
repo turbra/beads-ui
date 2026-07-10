@@ -20,6 +20,8 @@ export interface Issue extends IssueRef {
   issue_type?: string;
   assignee?: string | null;
   labels?: string[];
+  dependency_count?: number;
+  dependent_count?: number;
   comment_count?: number;
   comments?: Array<Record<string, unknown>>;
   // Relationship fields for detail payloads
@@ -42,6 +44,7 @@ export type SubscriptionType =
   | 'all-issues'
   | 'epics'
   | 'blocked-issues'
+  | 'issues-ready'
   | 'ready-issues'
   | 'in-progress-issues'
   | 'status-issues'
@@ -55,6 +58,8 @@ export interface SubscribeParamsBase {
   type: SubscriptionType;
   /** Optional parameters for the list, e.g., epic_id or filters. */
   params?: Record<string, unknown>;
+  /** Optional connection-local delivery capabilities. */
+  capabilities?: readonly string[];
 }
 
 export interface SubscribeMessage extends SubscribeParamsBase {
@@ -72,28 +77,37 @@ export interface UnsubscribeMessage {
 export type ClientMessage = SubscribeMessage | UnsubscribeMessage;
 
 export interface SnapshotMessage {
-  kind: 'snapshot';
+  type: 'snapshot';
   id: string; // client subscription id
   revision: number; // strictly increasing per subscription
   issues: Issue[];
+  truncated?: boolean;
 }
 
 export interface UpsertMessage {
-  kind: 'upsert';
+  type: 'upsert';
   id: string;
   revision: number;
   issue: Issue;
 }
 
 export interface DeleteMessage {
-  kind: 'delete';
+  type: 'delete';
   id: string;
   revision: number;
   issue_id: string;
 }
 
+export interface DeltaMessage {
+  type: 'delta';
+  id: string;
+  revision: number;
+  upserts: Issue[];
+  deletes: string[];
+}
+
 export interface ErrorMessage {
-  kind: 'error';
+  type: 'error';
   id?: string;
   code: string;
   message: string;
@@ -104,6 +118,7 @@ export type ServerMessage =
   | SnapshotMessage
   | UpsertMessage
   | DeleteMessage
+  | DeltaMessage
   | ErrorMessage;
 
 export interface SubscriptionRegistryEntry {

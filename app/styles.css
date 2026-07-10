@@ -372,6 +372,23 @@ a {
   border-left: 1px solid var(--border);
 }
 
+.subscription-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--danger, #b91c1c);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger, #b91c1c) 10%, var(--panel-bg));
+  color: var(--text);
+}
+
+.subscription-error button {
+  flex: 0 0 auto;
+}
+
 .panel__header {
   position: sticky;
   top: 0;
@@ -1160,6 +1177,21 @@ input.inline-edit:focus {
   color: var(--muted);
   font-size: 12px;
 }
+.progressive-list {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-6);
+  border-top: 1px solid var(--border);
+}
+.progressive-list__status {
+  color: var(--muted);
+  font-size: 12px;
+}
+.progressive-list__more {
+  min-height: 32px;
+}
 .sort-header {
   min-height: 0;
   padding: 0;
@@ -1777,6 +1809,80 @@ html[data-theme='dark'] {
   padding: 4px 8px;
   min-width: 28px;
   line-height: 1.2;
+}
+
+/* --- Keyboard Shortcut Help --- */
+#shortcut-help-dialog {
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  width: min(680px, 96vw);
+  max-height: 90vh;
+  overflow: hidden;
+}
+#shortcut-help-dialog::backdrop {
+  background: color-mix(in srgb, #000 45%, transparent);
+  backdrop-filter: blur(1px);
+}
+.shortcut-help__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-6);
+  border-bottom: 1px solid var(--border);
+}
+.shortcut-help__header h2,
+.shortcut-help__header p {
+  margin: 0;
+}
+.shortcut-help__header p {
+  margin-top: var(--space-2);
+  color: var(--muted);
+  font-size: 13px;
+}
+.shortcut-help__close {
+  min-width: 32px;
+  padding: 4px 8px;
+}
+.shortcut-help__body {
+  max-height: calc(90vh - 76px);
+  padding: var(--space-5) var(--space-6) var(--space-6);
+  overflow: auto;
+}
+.shortcut-help__body h3 {
+  margin: var(--space-5) 0 var(--space-3);
+}
+.shortcut-help__body h3:first-child {
+  margin-top: 0;
+}
+.shortcut-help__list {
+  margin: 0;
+}
+.shortcut-help__list > div {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) 2fr;
+  gap: var(--space-4);
+  align-items: baseline;
+  padding: var(--space-2) 0;
+}
+.shortcut-help__list dt,
+.shortcut-help__list dd {
+  margin: 0;
+}
+.shortcut-help kbd {
+  display: inline-block;
+  min-width: 24px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  text-align: center;
 }
 
 /* --- Fatal Error Dialog --- */

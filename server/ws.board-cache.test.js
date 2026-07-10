@@ -248,4 +248,25 @@ describe('ws board cache', () => {
     );
     wss.close();
   });
+
+  test('does not serve Issues Ready subscriptions from the Board cache', async () => {
+    const server = createServer();
+    const { prewarmBoardCache, wss } = attachWsServer(server, { path: '/ws' });
+    const mock = resetAdapterMock();
+    await prewarmBoardCache();
+    mock.mockClear();
+    const sock = createSocket();
+
+    await subscribeList(sock, 'tab:issues', 'issues-ready');
+
+    expect(mock).toHaveBeenCalledTimes(1);
+    expect(mock).toHaveBeenCalledWith(
+      { type: 'issues-ready', params: undefined },
+      expect.any(Object)
+    );
+    expect(findSnapshot(sock).payload.issues).toEqual(
+      makeItems({ type: 'issues-ready' })
+    );
+    wss.close();
+  });
 });

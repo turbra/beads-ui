@@ -31,6 +31,7 @@ export function createIssueDialog(mount_element, store, onClose) {
         </div>
         <button type="button" class="issue-dialog__close" aria-label="Close">×</button>
       </header>
+      <div id="issue-dialog-error"></div>
       <div class="issue-dialog__body" id="issue-dialog-body"></div>
     </div>
   `;

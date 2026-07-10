@@ -3,7 +3,7 @@
 ```
 Date: 2025-10-26
 Amended: 2026-07-10
-Status: v2 implemented; subscription-delta-v1 accepted, implementation pending
+Status: v2 and subscription-delta-v1 implemented
 Owner: agent
 ```
 
@@ -199,10 +199,9 @@ types remain supported.
 ## Updates
 
 Subsequent refreshes emit `upsert` and `delete` envelopes as the list changes.
-Once `subscription-delta-v1` is implemented and selected, a refresh with two or
-more total changes emits one `delta` instead. A one-change refresh retains the
-smaller legacy envelope. Empty refreshes emit nothing. Initial snapshots are
-unchanged.
+When `subscription-delta-v1` is selected, a refresh with two or more total
+changes emits one `delta` instead. A one-change refresh retains the smaller
+legacy envelope. Empty refreshes emit nothing. Initial snapshots are unchanged.
 
 ```json
 {

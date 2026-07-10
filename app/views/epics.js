@@ -18,7 +18,7 @@ import { createIssueRowRenderer } from './issue-row.js';
  * @param {HTMLElement} mount_element
  * @param {{ updateIssue: (input: any) => Promise<any> }} data
  * @param {(id: string) => void} goto_issue - Navigate to issue detail.
- * @param {{ subscribeList: (client_id: string, spec: { type: string, params?: Record<string, string|number|boolean> }) => Promise<() => Promise<void>>, selectors: { getIds: (client_id: string) => string[], count?: (client_id: string) => number } }} [subscriptions]
+ * @param {{ subscribeList: (client_id: string, spec: { type: string, params?: Record<string, string|number|boolean> }) => Promise<() => Promise<void>> }} [subscriptions]
  * @param {{ snapshotFor?: (client_id: string) => any[], subscribe?: (fn: (client_id?: string) => void) => () => void }} [issue_stores]
  */
 export function createEpicsView(

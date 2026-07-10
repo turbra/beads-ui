@@ -1,10 +1,13 @@
 import { spawn } from 'node:child_process';
+import path from 'node:path';
 import { resolveDbPath } from './db.js';
 import { debug } from './logging.js';
 
 const log = debug('bd');
 const BD_INTERACTIVE_BURST_LIMIT = 4;
 const DEFAULT_BD_TIMEOUT_MS = 30000;
+const GIT_USER_NAME_CACHE_LIMIT = 32;
+const GIT_USER_NAME_CACHE_TTL_MS = 5 * 60 * 1000;
 
 /**
  * @typedef {'interactive' | 'background'} BdPriority
@@ -17,17 +20,18 @@ const bd_queue_interactive = [];
 const bd_queue_background = [];
 let bd_queue_running = false;
 let bd_queue_interactive_burst = 0;
+/** @type {Map<string, { expires_at: number, promise: Promise<string> }>} */
+const git_user_name_cache = new Map();
 
 /**
- * Get the git user name from git config.
+ * Read the git user name from git config.
  *
- * @param {{ cwd?: string }} [options]
- * @returns {Promise<string>}
+ * @param {string} cwd
  */
-export async function getGitUserName(options = {}) {
+function readGitUserName(cwd) {
   return new Promise((resolve) => {
     const child = spawn('git', ['config', 'user.name'], {
-      cwd: options.cwd || process.cwd(),
+      cwd,
       shell: false,
       windowsHide: true
     });
@@ -49,6 +53,45 @@ export async function getGitUserName(options = {}) {
       resolve(chunks.join('').trim());
     });
   });
+}
+
+/**
+ * Get the git user name from a bounded, workspace-scoped cache. The in-flight
+ * promise is cached so concurrent comment posts share one git process.
+ *
+ * @param {{ cwd?: string }} [options]
+ * @returns {Promise<string>}
+ */
+export function getGitUserName(options = {}) {
+  const cwd = path.resolve(options.cwd || process.cwd());
+  const now = Date.now();
+  const cached = git_user_name_cache.get(cwd);
+  if (cached && cached.expires_at > now) {
+    git_user_name_cache.delete(cwd);
+    git_user_name_cache.set(cwd, cached);
+    return cached.promise;
+  }
+  if (cached) {
+    git_user_name_cache.delete(cwd);
+  }
+  const promise = readGitUserName(cwd);
+  git_user_name_cache.set(cwd, {
+    expires_at: now + GIT_USER_NAME_CACHE_TTL_MS,
+    promise
+  });
+  while (git_user_name_cache.size > GIT_USER_NAME_CACHE_LIMIT) {
+    const oldest_key = git_user_name_cache.keys().next().value;
+    if (oldest_key === undefined) {
+      break;
+    }
+    git_user_name_cache.delete(oldest_key);
+  }
+  return promise;
+}
+
+/** Clear cached Git identities after configuration changes or in tests. */
+export function clearGitUserNameCache() {
+  git_user_name_cache.clear();
 }
 
 /**

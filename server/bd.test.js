@@ -5,7 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { getBdBin, getGitUserName, runBd, runBdJson } from './bd.js';
+import {
+  clearGitUserNameCache,
+  getBdBin,
+  getGitUserName,
+  runBd,
+  runBdJson
+} from './bd.js';
 
 // Mock child_process.spawn before importing the module under test
 vi.mock('node:child_process', () => ({ spawn: vi.fn() }));
@@ -78,6 +84,7 @@ async function waitForLength(list, length) {
 
 beforeEach(() => {
   mockedSpawn.mockReset();
+  clearGitUserNameCache();
 });
 
 afterEach(() => {
@@ -454,5 +461,60 @@ describe('getGitUserName', () => {
     mockedSpawn.mockReturnValueOnce(makeFakeProc('', 'error', 1));
     const name = await getGitUserName();
     expect(name).toBe('');
+  });
+
+  test('shares concurrent and repeated workspace lookups', async () => {
+    mockedSpawn.mockReturnValueOnce(makeFakeProc('Alice\n', '', 0));
+
+    const names = await Promise.all([
+      getGitUserName({ cwd: '/workspace/one' }),
+      getGitUserName({ cwd: '/workspace/one' })
+    ]);
+    const repeated = await getGitUserName({ cwd: '/workspace/one' });
+
+    expect(names).toEqual(['Alice', 'Alice']);
+    expect(repeated).toBe('Alice');
+    expect(mockedSpawn).toHaveBeenCalledTimes(1);
+  });
+
+  test('isolates repository-local identities by workspace', async () => {
+    mockedSpawn
+      .mockReturnValueOnce(makeFakeProc('Alice\n', '', 0))
+      .mockReturnValueOnce(makeFakeProc('Bob\n', '', 0));
+
+    const alice = await getGitUserName({ cwd: '/workspace/one' });
+    const bob = await getGitUserName({ cwd: '/workspace/two' });
+
+    expect(alice).toBe('Alice');
+    expect(bob).toBe('Bob');
+    expect(mockedSpawn.mock.calls.map(([, , options]) => options.cwd)).toEqual([
+      '/workspace/one',
+      '/workspace/two'
+    ]);
+  });
+
+  test('caches failed lookups safely', async () => {
+    mockedSpawn.mockReturnValueOnce(makeFakeProc('', 'error', 1));
+
+    const first = await getGitUserName({ cwd: '/workspace/failing' });
+    const second = await getGitUserName({ cwd: '/workspace/failing' });
+
+    expect(first).toBe('');
+    expect(second).toBe('');
+    expect(mockedSpawn).toHaveBeenCalledTimes(1);
+  });
+
+  test('bounds the workspace cache', async () => {
+    for (let index = 0; index < 34; index += 1) {
+      mockedSpawn.mockReturnValueOnce(makeFakeProc(`User ${index}\n`, '', 0));
+    }
+    for (let index = 0; index < 33; index += 1) {
+      await getGitUserName({ cwd: `/workspace/${index}` });
+    }
+
+    const evicted = await getGitUserName({ cwd: '/workspace/0' });
+
+    expect(evicted).toBe('User 33');
+    expect(mockedSpawn).toHaveBeenCalledTimes(34);
   });
 });

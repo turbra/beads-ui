@@ -18,11 +18,11 @@ import { showToast } from './utils/toast.js';
 import { createBoardView } from './views/board.js';
 import { createDetailView } from './views/detail.js';
 import { createEpicsView } from './views/epics.js';
-import { createFatalErrorDialog } from './views/fatal-error-dialog.js';
 import { createIssueDialog } from './views/issue-dialog.js';
 import { createListView } from './views/list.js';
 import { createTopNav } from './views/nav.js';
 import { createNewIssueDialog } from './views/new-issue-dialog.js';
+import { createShortcutHelpDialog } from './views/shortcut-help-dialog.js';
 import { createWorkspacePicker } from './views/workspace-picker.js';
 import { createWsClient } from './ws.js';
 
@@ -38,10 +38,17 @@ export function bootstrap(root_element) {
   // Render route shells (nav is mounted in header)
   const shell = html`
     <section id="issues-root" class="route issues">
+      <div id="issues-subscription-errors"></div>
       <aside id="list-panel" class="panel"></aside>
     </section>
-    <section id="epics-root" class="route epics" hidden></section>
-    <section id="board-root" class="route board" hidden></section>
+    <section id="epics-root" class="route epics" hidden>
+      <div id="epics-subscription-errors"></div>
+      <div id="epics-view"></div>
+    </section>
+    <section id="board-root" class="route board" hidden>
+      <div id="board-subscription-errors"></div>
+      <div id="board-view"></div>
+    </section>
     <section id="detail-panel" class="route detail" hidden></section>
   `;
   render(shell, root_element);
@@ -54,55 +61,135 @@ export function bootstrap(root_element) {
   const epics_root = document.getElementById('epics-root');
   /** @type {HTMLElement|null} */
   const board_root = document.getElementById('board-root');
+  /** @type {HTMLElement|null} */
+  const epics_mount = document.getElementById('epics-view');
+  /** @type {HTMLElement|null} */
+  const board_mount = document.getElementById('board-view');
 
   /** @type {HTMLElement|null} */
   const list_mount = document.getElementById('list-panel');
   /** @type {HTMLElement|null} */
   const detail_mount = document.getElementById('detail-panel');
-  if (list_mount && issues_root && epics_root && board_root && detail_mount) {
+  if (
+    list_mount &&
+    issues_root &&
+    epics_root &&
+    board_root &&
+    epics_mount &&
+    board_mount &&
+    detail_mount
+  ) {
     /** @type {HTMLElement|null} */
     const header_loading = document.getElementById('header-loading');
     const activity = createActivityIndicator(header_loading);
-    const fatal_dialog = createFatalErrorDialog(root_element);
 
     /**
-     * Show a blocking dialog when a backend command fails.
-     *
-     * @param {unknown} err
-     * @param {string} context
+     * @typedef {{ context: string, message: string, retry: () => void | Promise<void>, scope: 'issues'|'epics'|'board'|'detail' }} SubscriptionError
      */
-    function showFatalFromError(err, context) {
-      /** @type {string} */
-      let message = 'Request failed';
-      /** @type {string} */
-      let detail = '';
+    /** @type {Map<string, SubscriptionError>} */
+    const subscription_errors = new Map();
 
-      if (err && typeof err === 'object') {
-        const any = /** @type {{ message?: unknown, details?: unknown }} */ (
-          err
-        );
-        if (typeof any.message === 'string' && any.message.length > 0) {
-          message = any.message;
-        }
-        if (typeof any.details === 'string') {
-          detail = any.details;
-        } else if (any.details && typeof any.details === 'object') {
-          try {
-            detail = JSON.stringify(any.details, null, 2);
-          } catch {
-            detail = '';
-          }
-        }
-      } else if (typeof err === 'string' && err.length > 0) {
-        message = err;
+    /**
+     * @param {'issues'|'epics'|'board'|'detail'} scope
+     */
+    function subscriptionErrorHost(scope) {
+      const id =
+        scope === 'issues'
+          ? 'issues-subscription-errors'
+          : scope === 'epics'
+            ? 'epics-subscription-errors'
+            : scope === 'board'
+              ? 'board-subscription-errors'
+              : 'issue-dialog-error';
+      return document.getElementById(id);
+    }
+
+    /**
+     * @param {unknown} err
+     */
+    function subscriptionErrorMessage(err) {
+      if (typeof err === 'string' && err.length > 0) {
+        return err;
       }
+      if (err && typeof err === 'object') {
+        const message = /** @type {{ message?: unknown }} */ (err).message;
+        if (typeof message === 'string' && message.length > 0) {
+          return message;
+        }
+      }
+      return 'Live updates could not be loaded.';
+    }
 
-      const title =
-        context && context.length > 0
-          ? `Failed to load ${context}`
-          : 'Request failed';
+    /**
+     * @param {'issues'|'epics'|'board'|'detail'} scope
+     */
+    function renderSubscriptionErrors(scope) {
+      const host = subscriptionErrorHost(scope);
+      if (!host) {
+        return;
+      }
+      host.replaceChildren();
+      for (const [client_id, error] of subscription_errors) {
+        if (error.scope !== scope) {
+          continue;
+        }
+        const banner = document.createElement('div');
+        banner.className = 'subscription-error';
+        banner.dataset.subscriptionId = client_id;
+        banner.setAttribute('role', 'alert');
+        const text = document.createElement('span');
+        text.textContent = `${error.context}: ${error.message}`;
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.textContent = 'Retry';
+        retry.addEventListener('click', () => {
+          retry.disabled = true;
+          void error.retry();
+        });
+        banner.append(text, retry);
+        host.appendChild(banner);
+      }
+    }
 
-      fatal_dialog.open(title, message, detail);
+    /**
+     * @param {string} client_id
+     * @param {'issues'|'epics'|'board'|'detail'} scope
+     * @param {string} context
+     * @param {unknown} err
+     * @param {() => void | Promise<void>} retry
+     */
+    function setSubscriptionError(client_id, scope, context, err, retry) {
+      subscription_errors.set(client_id, {
+        context,
+        message: subscriptionErrorMessage(err),
+        retry,
+        scope
+      });
+      renderSubscriptionErrors(scope);
+    }
+
+    /**
+     * @param {string} client_id
+     */
+    function clearSubscriptionError(client_id) {
+      const error = subscription_errors.get(client_id);
+      if (!error) {
+        return;
+      }
+      subscription_errors.delete(client_id);
+      renderSubscriptionErrors(error.scope);
+    }
+
+    /**
+     * @param {'issues'|'epics'|'board'|'detail'} scope
+     */
+    function clearSubscriptionErrors(scope) {
+      for (const [client_id, error] of subscription_errors) {
+        if (error.scope === scope) {
+          subscription_errors.delete(client_id);
+        }
+      }
+      renderSubscriptionErrors(scope);
     }
 
     /**
@@ -132,42 +219,73 @@ export function bootstrap(root_element) {
     const subscriptions = createSubscriptionStore(tracked_send);
     // Per-subscription stores (source of truth)
     const sub_issue_stores = createSubscriptionIssueStores();
+
+    /**
+     * Request a fresh snapshot after a store rejects a malformed delta.
+     *
+     * @param {string} client_id
+     */
+    function requestSubscriptionResync(client_id) {
+      void subscriptions.resubscribeOne(client_id).catch((err) => {
+        log('subscription resync failed for %s: %o', client_id, err);
+        if (!isExpectedSubscriptionError(err)) {
+          showToast('Live updates need to reconnect', 'error', 3200);
+        }
+      });
+    }
+
+    /**
+     * Route one server push to its subscription store.
+     *
+     * @param {'snapshot'|'upsert'|'delete'|'delta'} expected_type
+     * @param {unknown} payload
+     */
+    function routeSubscriptionPush(expected_type, payload) {
+      const push = /** @type {any} */ (payload);
+      const client_id = push && typeof push.id === 'string' ? push.id : '';
+      const issue_store = client_id
+        ? sub_issue_stores.getStore(client_id)
+        : null;
+      if (!issue_store || !push) {
+        return;
+      }
+      if (push.type !== expected_type) {
+        if (expected_type === 'delta') {
+          const result = issue_store.requireResync();
+          if (result === 'resync-needed') {
+            requestSubscriptionResync(client_id);
+          }
+        }
+        return;
+      }
+      try {
+        const result = issue_store.applyPush(push);
+        if (result === 'resync-needed') {
+          requestSubscriptionResync(client_id);
+        }
+      } catch (err) {
+        log('failed to apply %s for %s: %o', expected_type, client_id, err);
+        if (expected_type === 'delta') {
+          const result = issue_store.requireResync();
+          if (result === 'resync-needed') {
+            requestSubscriptionResync(client_id);
+          }
+        }
+      }
+    }
+
     // Route per-subscription push envelopes to the owning store
     client.on('snapshot', (payload) => {
-      const p = /** @type {any} */ (payload);
-      const id = p && typeof p.id === 'string' ? p.id : '';
-      const store = id ? sub_issue_stores.getStore(id) : null;
-      if (store && p && p.type === 'snapshot') {
-        try {
-          store.applyPush(p);
-        } catch {
-          // ignore
-        }
-      }
+      routeSubscriptionPush('snapshot', payload);
     });
     client.on('upsert', (payload) => {
-      const p = /** @type {any} */ (payload);
-      const id = p && typeof p.id === 'string' ? p.id : '';
-      const store = id ? sub_issue_stores.getStore(id) : null;
-      if (store && p && p.type === 'upsert') {
-        try {
-          store.applyPush(p);
-        } catch {
-          // ignore
-        }
-      }
+      routeSubscriptionPush('upsert', payload);
     });
     client.on('delete', (payload) => {
-      const p = /** @type {any} */ (payload);
-      const id = p && typeof p.id === 'string' ? p.id : '';
-      const store = id ? sub_issue_stores.getStore(id) : null;
-      if (store && p && p.type === 'delete') {
-        try {
-          store.applyPush(p);
-        } catch {
-          // ignore
-        }
-      }
+      routeSubscriptionPush('delete', payload);
+    });
+    client.on('delta', (payload) => {
+      routeSubscriptionPush('delta', payload);
     });
     // Derived list selectors: render from per-subscription snapshots
     const listSelectors = createListSelectors(sub_issue_stores);
@@ -393,6 +511,10 @@ export function bootstrap(root_element) {
         try {
           await subscriptions.resubscribeAll();
           if (recovery_epoch === connection_epoch) {
+            clearSubscriptionErrors('issues');
+            clearSubscriptionErrors('epics');
+            clearSubscriptionErrors('board');
+            clearSubscriptionErrors('detail');
             showToast('Reconnected', 'success', 2200);
           }
           return;
@@ -542,6 +664,7 @@ export function bootstrap(root_element) {
       router,
       store
     );
+    const shortcut_help_dialog = createShortcutHelpDialog(root_element);
     // Header button
     try {
       const btn_new = /** @type {HTMLButtonElement|null} */ (
@@ -549,6 +672,12 @@ export function bootstrap(root_element) {
       );
       if (btn_new) {
         btn_new.addEventListener('click', () => new_issue_dialog.open());
+      }
+      const btn_help = /** @type {HTMLButtonElement|null} */ (
+        document.getElementById('shortcut-help-btn')
+      );
+      if (btn_help) {
+        btn_help.addEventListener('click', () => shortcut_help_dialog.open());
       }
     } catch {
       // ignore missing header
@@ -582,7 +711,6 @@ export function bootstrap(root_element) {
         }
       },
       store,
-      subscriptions,
       sub_issue_stores
     );
     // Persist filter changes to localStorage
@@ -701,6 +829,34 @@ export function bootstrap(root_element) {
     }
 
     /**
+     * @param {string} client_id
+     * @param {{ type: string, params: { id: string } }} spec
+     * @param {string} detail_id
+     */
+    async function subscribeDetail(client_id, spec, detail_id) {
+      const request_epoch = subscription_epoch;
+      try {
+        const unsub = await subscriptions.subscribeList(client_id, spec);
+        if (
+          request_epoch !== subscription_epoch ||
+          active_detail_id !== detail_id
+        ) {
+          void unsub().catch(() => {});
+          return;
+        }
+        unsub_detail = unsub;
+        clearSubscriptionError(client_id);
+      } catch (err) {
+        log('detail subscribe failed: %o', err);
+        if (!isExpectedSubscriptionError(err)) {
+          setSubscriptionError(client_id, 'detail', 'Issue details', err, () =>
+            subscribeDetail(client_id, spec, detail_id)
+          );
+        }
+      }
+    }
+
+    /**
      * @param {string} id
      */
     function openDetail(id) {
@@ -735,25 +891,7 @@ export function bootstrap(root_element) {
       if (detail) {
         void detail.load(detail_id);
       }
-      const request_epoch = subscription_epoch;
-      void subscriptions
-        .subscribeList(client_id, spec)
-        .then((unsub) => {
-          if (
-            request_epoch !== subscription_epoch ||
-            active_detail_id !== detail_id
-          ) {
-            void unsub().catch(() => {});
-            return;
-          }
-          unsub_detail = unsub;
-        })
-        .catch((err) => {
-          log('detail subscribe failed: %o', err);
-          if (!isExpectedSubscriptionError(err)) {
-            showFatalFromError(err, 'issue details');
-          }
-        });
+      void subscribeDetail(client_id, spec, detail_id);
     }
 
     /**
@@ -779,6 +917,7 @@ export function bootstrap(root_element) {
         unsub_detail = null;
       }
       if (previous_id) {
+        clearSubscriptionError(`detail:${previous_id}`);
         try {
           sub_issue_stores.unregister(`detail:${previous_id}`);
         } catch {
@@ -806,18 +945,16 @@ export function bootstrap(root_element) {
     // Toggle route shells on view/detail change and persist
     const data = createDataLayer(transport);
     const epics_view = createEpicsView(
-      epics_root,
+      epics_mount,
       data,
       (id) => router.gotoIssue(id),
       subscriptions,
       sub_issue_stores
     );
     const board_view = createBoardView(
-      board_root,
-      data,
+      board_mount,
       (id) => router.gotoIssue(id),
       store,
-      subscriptions,
       sub_issue_stores,
       transport
     );
@@ -876,7 +1013,7 @@ export function bootstrap(root_element) {
     function computeIssuesSpec(filters) {
       const statuses = normalizeStatusFilters(filters?.status);
       if (statuses.includes('ready')) {
-        return { type: 'ready-issues' };
+        return { type: 'issues-ready' };
       }
       if (statuses.length > 0) {
         return {
@@ -1004,25 +1141,35 @@ export function bootstrap(root_element) {
               }
               unsub_issues_tab = unsub;
               last_issues_spec_key = key;
+              clearSubscriptionError('tab:issues');
             })
             .catch((err) => {
               log('subscribe issues failed: %o', err);
               if (!isExpectedSubscriptionError(err)) {
-                showFatalFromError(err, 'issues list');
+                setSubscriptionError(
+                  'tab:issues',
+                  'issues',
+                  'Issues list',
+                  err,
+                  () => ensureTabSubscriptions(store.getState())
+                );
               }
             })
             .finally(() => {
               finishPendingSubscription(issues_sub_key, request_epoch);
             });
         }
-      } else if (unsub_issues_tab) {
-        void unsub_issues_tab().catch(() => {});
-        unsub_issues_tab = null;
-        last_issues_spec_key = null;
-        try {
-          sub_issue_stores.unregister('tab:issues');
-        } catch (err) {
-          log('unregister issues store failed: %o', err);
+      } else {
+        clearSubscriptionErrors('issues');
+        if (unsub_issues_tab) {
+          void unsub_issues_tab().catch(() => {});
+          unsub_issues_tab = null;
+          last_issues_spec_key = null;
+          try {
+            sub_issue_stores.unregister('tab:issues');
+          } catch (err) {
+            log('unregister issues store failed: %o', err);
+          }
         }
       }
 
@@ -1049,24 +1196,30 @@ export function bootstrap(root_element) {
                 return;
               }
               unsub_epics_tab = unsub;
+              clearSubscriptionError('tab:epics');
             })
             .catch((err) => {
               log('subscribe epics failed: %o', err);
               if (!isExpectedSubscriptionError(err)) {
-                showFatalFromError(err, 'epics');
+                setSubscriptionError('tab:epics', 'epics', 'Epics', err, () =>
+                  ensureTabSubscriptions(store.getState())
+                );
               }
             })
             .finally(() => {
               finishPendingSubscription('tab:epics', request_epoch);
             });
         }
-      } else if (unsub_epics_tab) {
-        void unsub_epics_tab().catch(() => {});
-        unsub_epics_tab = null;
-        try {
-          sub_issue_stores.unregister('tab:epics');
-        } catch (err) {
-          log('unregister epics store failed: %o', err);
+      } else {
+        clearSubscriptionErrors('epics');
+        if (unsub_epics_tab) {
+          void unsub_epics_tab().catch(() => {});
+          unsub_epics_tab = null;
+          try {
+            sub_issue_stores.unregister('tab:epics');
+          } catch (err) {
+            log('unregister epics store failed: %o', err);
+          }
         }
       }
 
@@ -1097,11 +1250,18 @@ export function bootstrap(root_element) {
                 return;
               }
               unsub_board_ready = unsub;
+              clearSubscriptionError('tab:board:ready');
             })
             .catch((err) => {
               log('subscribe board ready failed: %o', err);
               if (!isExpectedSubscriptionError(err)) {
-                showFatalFromError(err, 'board (Ready)');
+                setSubscriptionError(
+                  'tab:board:ready',
+                  'board',
+                  'Board Ready',
+                  err,
+                  () => ensureTabSubscriptions(store.getState())
+                );
               }
             })
             .finally(() => {
@@ -1135,11 +1295,18 @@ export function bootstrap(root_element) {
                 return;
               }
               unsub_board_in_progress = unsub;
+              clearSubscriptionError('tab:board:in-progress');
             })
             .catch((err) => {
               log('subscribe board in-progress failed: %o', err);
               if (!isExpectedSubscriptionError(err)) {
-                showFatalFromError(err, 'board (In Progress)');
+                setSubscriptionError(
+                  'tab:board:in-progress',
+                  'board',
+                  'Board In Progress',
+                  err,
+                  () => ensureTabSubscriptions(store.getState())
+                );
               }
             })
             .finally(() => {
@@ -1190,11 +1357,18 @@ export function bootstrap(root_element) {
               }
               unsub_board_closed = unsub;
               last_board_closed_spec_key = closed_key;
+              clearSubscriptionError('tab:board:closed');
             })
             .catch((err) => {
               log('subscribe board closed failed: %o', err);
               if (!isExpectedSubscriptionError(err)) {
-                showFatalFromError(err, 'board (Closed)');
+                setSubscriptionError(
+                  'tab:board:closed',
+                  'board',
+                  'Board Closed',
+                  err,
+                  () => ensureTabSubscriptions(store.getState())
+                );
               }
             })
             .finally(() => {
@@ -1226,11 +1400,18 @@ export function bootstrap(root_element) {
                 return;
               }
               unsub_board_blocked = unsub;
+              clearSubscriptionError('tab:board:blocked');
             })
             .catch((err) => {
               log('subscribe board blocked failed: %o', err);
               if (!isExpectedSubscriptionError(err)) {
-                showFatalFromError(err, 'board (Blocked)');
+                setSubscriptionError(
+                  'tab:board:blocked',
+                  'board',
+                  'Board Blocked',
+                  err,
+                  () => ensureTabSubscriptions(store.getState())
+                );
               }
             })
             .finally(() => {
@@ -1238,6 +1419,7 @@ export function bootstrap(root_element) {
             });
         }
       } else {
+        clearSubscriptionErrors('board');
         // Unsubscribe all board lists when leaving the board view
         if (unsub_board_ready) {
           void unsub_board_ready().catch(() => {});
@@ -1344,26 +1526,66 @@ export function bootstrap(root_element) {
 
     // Removed redundant filter-change subscription: handled by ensureTabSubscriptions
 
-    // Keyboard shortcuts: Ctrl/Cmd+N opens new issue; Ctrl/Cmd+Enter submits inside dialog
-    window.addEventListener('keydown', (ev) => {
-      const is_modifier = ev.ctrlKey || ev.metaKey;
-      const key = String(ev.key || '').toLowerCase();
-      const target = /** @type {HTMLElement} */ (ev.target);
-      const tag =
-        target && target.tagName ? String(target.tagName).toLowerCase() : '';
-      const is_editable =
+    /**
+     * Return whether a global shortcut originated in an editable control.
+     *
+     * @param {EventTarget | null} target
+     */
+    function isEditableShortcutTarget(target) {
+      if (!(target instanceof HTMLElement)) {
+        return false;
+      }
+      const tag = target.tagName.toLowerCase();
+      return (
         tag === 'input' ||
         tag === 'textarea' ||
         tag === 'select' ||
-        (target &&
-          typeof target.isContentEditable === 'boolean' &&
-          target.isContentEditable);
+        target.isContentEditable ||
+        Boolean(
+          target.closest('[contenteditable="true"], [contenteditable=""]')
+        )
+      );
+    }
+
+    /** Return whether a modal dialog is currently open. */
+    function hasOpenDialog() {
+      return document.querySelector('dialog[open]') !== null;
+    }
+
+    // Global shortcuts are disabled while typing or while a modal is open.
+    window.addEventListener('keydown', (ev) => {
+      const is_modifier = ev.ctrlKey || ev.metaKey;
+      const key = String(ev.key || '').toLowerCase();
+      const is_editable = isEditableShortcutTarget(ev.target);
+      const has_open_dialog = hasOpenDialog();
       if (is_modifier && key === 'n') {
-        // Do not hijack when typing in inputs; common UX
-        if (!is_editable) {
+        if (!is_editable && !has_open_dialog) {
           ev.preventDefault();
           new_issue_dialog.open();
         }
+        return;
+      }
+      if (
+        !is_modifier &&
+        !ev.altKey &&
+        key === '/' &&
+        !is_editable &&
+        !has_open_dialog &&
+        store.getState().view === 'issues' &&
+        issues_view.focusSearch()
+      ) {
+        ev.preventDefault();
+        return;
+      }
+      if (
+        !is_modifier &&
+        !ev.altKey &&
+        ev.key === '?' &&
+        !is_editable &&
+        !has_open_dialog
+      ) {
+        ev.preventDefault();
+        shortcut_help_dialog.open();
       }
     });
   }

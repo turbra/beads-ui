@@ -77,8 +77,60 @@ describe('issues status subscriptions', () => {
       payload: {
         id: 'tab:issues',
         type: 'status-issues',
-        params: { statuses: 'open,closed' }
+        params: { statuses: 'open,closed' },
+        capabilities: ['subscription-delta-v1']
       }
+    });
+  });
+
+  test('keeps Issues and Board Ready subscriptions distinct', async () => {
+    /** @type {{ type: string, payload: any }[]} */
+    const calls = [];
+    CLIENT = {
+      /**
+       * @param {string} type
+       * @param {any} payload
+       */
+      async send(type, payload) {
+        calls.push({ type, payload });
+        if (type === 'list-workspaces') {
+          return { current: null, workspaces: [] };
+        }
+        return null;
+      },
+      on() {
+        return () => {};
+      },
+      onConnection() {
+        return () => {};
+      },
+      close() {},
+      getState() {
+        return 'open';
+      }
+    };
+    window.localStorage.setItem(
+      'beads-ui.filters',
+      JSON.stringify({ status: ['ready'], type: [], search: '' })
+    );
+    const root = /** @type {HTMLElement} */ (document.getElementById('app'));
+
+    bootstrap(root);
+    await flushPromises();
+    window.location.hash = '#/board';
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await flushPromises();
+
+    const subscriptions = calls
+      .filter((call) => call.type === 'subscribe-list')
+      .map((call) => ({ id: call.payload.id, type: call.payload.type }));
+    expect(subscriptions).toContainEqual({
+      id: 'tab:issues',
+      type: 'issues-ready'
+    });
+    expect(subscriptions).toContainEqual({
+      id: 'tab:board:ready',
+      type: 'ready-issues'
     });
   });
 

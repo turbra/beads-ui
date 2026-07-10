@@ -8,15 +8,15 @@ vi.mock('./ws.js', () => {
   const handlers = {};
   /** @type {Set<(s: 'connecting'|'open'|'closed'|'reconnecting') => void>} */
   const connHandlers = new Set();
+  /** @type {Array<{ type: string, payload: any }>} */
+  const sent = [];
   const singleton = {
     /**
      * @param {import('./protocol.js').MessageType} type
      * @param {any} payload
      */
     async send(type, payload) {
-      // Subscriptions are fire-and-forget in tests
-      void type;
-      void payload;
+      sent.push({ type, payload });
       return null;
     },
     /**
@@ -57,6 +57,7 @@ vi.mock('./ws.js', () => {
         }
       }
     },
+    _sent: sent,
     close() {},
     getState() {
       return 'open';
@@ -81,6 +82,16 @@ describe('push stores integration (board view)', () => {
     bootstrap(root);
     // Allow router + subscriptions to wire
     await flushBootstrap();
+
+    expect(client._sent).toContainEqual({
+      type: 'subscribe-list',
+      payload: {
+        id: 'tab:board:ready',
+        type: 'ready-issues',
+        params: undefined,
+        capabilities: ['subscription-delta-v1']
+      }
+    });
 
     // Initial board: no cards
     expect(document.querySelectorAll('#ready-col .board-card').length).toBe(0);
@@ -141,6 +152,28 @@ describe('push stores integration (board view)', () => {
     ).toBe(0);
     // Ready unaffected
     expect(document.querySelectorAll('#ready-col .board-card').length).toBe(3);
+
+    // A capable server can update and remove Ready items atomically.
+    client._trigger('delta', {
+      type: 'delta',
+      id: 'tab:board:ready',
+      revision: 3,
+      upserts: [
+        {
+          id: 'R-1',
+          title: 'ready 1 updated',
+          priority: 1,
+          updated_at: 13_000
+        }
+      ],
+      deletes: ['R-2']
+    });
+    await Promise.resolve();
+
+    expect(document.querySelectorAll('#ready-col .board-card').length).toBe(2);
+    expect(document.querySelector('#ready-col')?.textContent).toContain(
+      'ready 1 updated'
+    );
   });
 
   test('reconnect replay does not duplicate entries', async () => {
@@ -190,5 +223,80 @@ describe('push stores integration (board view)', () => {
     });
     await Promise.resolve();
     expect(document.querySelectorAll('#ready-col .board-card').length).toBe(2);
+  });
+
+  test('requests a fresh snapshot after rejecting an invalid delta', async () => {
+    const client = /** @type {any} */ (createWsClient());
+    client._sent.length = 0;
+    window.location.hash = '#/board';
+    document.body.innerHTML = '<main id="app"></main>';
+    const root = /** @type {HTMLElement} */ (document.getElementById('app'));
+    bootstrap(root);
+    await flushBootstrap();
+    client._trigger('snapshot', {
+      type: 'snapshot',
+      id: 'tab:board:ready',
+      revision: 1,
+      issues: [{ id: 'R-1', title: 'ready 1', updated_at: 10_000 }]
+    });
+    await Promise.resolve();
+    const sent_before = client._sent.length;
+
+    client._trigger('delta', {
+      type: 'delta',
+      id: 'tab:board:ready',
+      revision: 2,
+      upserts: [{ id: 'R-2', title: 'invalid one-change delta' }],
+      deletes: []
+    });
+    await Promise.resolve();
+
+    expect(document.querySelectorAll('#ready-col .board-card').length).toBe(1);
+    expect(client._sent.slice(sent_before)).toContainEqual({
+      type: 'subscribe-list',
+      payload: {
+        id: 'tab:board:ready',
+        type: 'ready-issues',
+        params: undefined,
+        capabilities: ['subscription-delta-v1']
+      }
+    });
+  });
+
+  test('resynchronizes after a mismatched delta payload', async () => {
+    const client = /** @type {any} */ (createWsClient());
+    client._sent.length = 0;
+    window.location.hash = '#/board';
+    document.body.innerHTML = '<main id="app"></main>';
+    const root = /** @type {HTMLElement} */ (document.getElementById('app'));
+    bootstrap(root);
+    await flushBootstrap();
+    client._trigger('snapshot', {
+      type: 'snapshot',
+      id: 'tab:board:ready',
+      revision: 1,
+      issues: [{ id: 'R-1', title: 'ready 1', updated_at: 10_000 }]
+    });
+    await Promise.resolve();
+    const sent_before = client._sent.length;
+
+    client._trigger('delta', {
+      type: 'upsert',
+      id: 'tab:board:ready',
+      revision: 2,
+      issue: { id: 'R-2', title: 'misrouted' }
+    });
+    await Promise.resolve();
+
+    expect(document.querySelectorAll('#ready-col .board-card')).toHaveLength(1);
+    expect(client._sent.slice(sent_before)).toContainEqual({
+      type: 'subscribe-list',
+      payload: {
+        id: 'tab:board:ready',
+        type: 'ready-issues',
+        params: undefined,
+        capabilities: ['subscription-delta-v1']
+      }
+    });
   });
 });

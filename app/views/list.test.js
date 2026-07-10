@@ -136,7 +136,6 @@ describe('views/list', () => {
         window.location.hash = hash;
       },
       undefined,
-      undefined,
       issueStores
     );
     await view.load();
@@ -170,7 +169,6 @@ describe('views/list', () => {
     const view = createListView(
       mount,
       async () => [],
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -243,7 +241,6 @@ describe('views/list', () => {
     const view = createListView(
       mount,
       async () => [],
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -337,7 +334,6 @@ describe('views/list', () => {
     const view = createListView(
       mount,
       async () => [],
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -437,7 +433,6 @@ describe('views/list', () => {
       async () => [],
       undefined,
       store,
-      undefined,
       issueStores
     );
     await view.load();
@@ -474,7 +469,6 @@ describe('views/list', () => {
     const view = createListView(
       mount,
       async () => [],
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -521,7 +515,6 @@ describe('views/list', () => {
     const view = createListView(
       mount,
       async () => [],
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -607,7 +600,6 @@ describe('views/list', () => {
       async () => [],
       undefined,
       store,
-      undefined,
       issueStores
     );
     await view.load();
@@ -648,7 +640,6 @@ describe('views/list', () => {
     const view = createListView(
       mount,
       async () => [],
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -710,7 +701,6 @@ describe('views/list', () => {
       async () => [],
       undefined,
       store,
-      undefined,
       issueStores
     );
     await view.load();
@@ -764,7 +754,6 @@ describe('views/list', () => {
         async () => [],
         undefined,
         undefined,
-        undefined,
         issueStores
       );
       await view.load();
@@ -812,7 +801,6 @@ describe('views/list', () => {
       async () => [],
       undefined,
       undefined,
-      undefined,
       issueStores
     );
     await view.load();
@@ -824,7 +812,7 @@ describe('views/list', () => {
     // With no explicit view sort, preserve the upstream store's order.
     expect(rowIds()).toEqual(['UI-A', 'UI-C', 'UI-B']);
     /** @type {HTMLButtonElement} */ (
-      mount.querySelector('button.sort-header')
+      mount.querySelector('button[aria-label="Sort by Priority"]')
     ).click();
     expect(rowIds()).toEqual(['UI-A', 'UI-C', 'UI-B']);
     expect(
@@ -832,7 +820,7 @@ describe('views/list', () => {
     ).toBe('Priority');
 
     /** @type {HTMLButtonElement} */ (
-      mount.querySelector('button.sort-header')
+      mount.querySelector('button[aria-label="Sort by Priority"]')
     ).click();
     expect(rowIds()).toEqual(['UI-B', 'UI-A', 'UI-C']);
 
@@ -844,6 +832,86 @@ describe('views/list', () => {
     expect(
       mount.querySelector('th[aria-sort="descending"]')?.textContent?.trim()
     ).toBe('Updated');
+  });
+
+  test('sorts every data column in both directions with stable ID ties', async () => {
+    document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const issueStores = createTestIssueStores();
+    issueStores.getStore('tab:issues').applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 1,
+      issues: [
+        {
+          id: 'UI-C',
+          title: 'Alpha',
+          issue_type: 'task',
+          status: 'closed',
+          assignee: 'Zoe',
+          priority: 2,
+          updated_at: '2025-01-01',
+          dependency_count: 2,
+          dependent_count: 1
+        },
+        {
+          id: 'UI-A',
+          title: 'Gamma',
+          issue_type: 'bug',
+          status: 'open',
+          assignee: '',
+          priority: 1,
+          updated_at: '2025-03-01',
+          dependency_count: 1,
+          dependent_count: 0
+        },
+        {
+          id: 'UI-B',
+          title: 'Beta',
+          issue_type: 'feature',
+          status: 'in_progress',
+          assignee: 'Alice',
+          priority: 1,
+          updated_at: '2025-02-01',
+          dependency_count: 0,
+          dependent_count: 1
+        }
+      ]
+    });
+    const view = createListView(
+      mount,
+      async () => [],
+      undefined,
+      undefined,
+      issueStores
+    );
+    await view.load();
+    const rowIds = () =>
+      Array.from(mount.querySelectorAll('tr.issue-row')).map((row) =>
+        row.getAttribute('data-issue-id')
+      );
+    const cases = [
+      ['ID', ['UI-A', 'UI-B', 'UI-C'], ['UI-C', 'UI-B', 'UI-A']],
+      ['Type', ['UI-A', 'UI-B', 'UI-C'], ['UI-C', 'UI-B', 'UI-A']],
+      ['Title', ['UI-C', 'UI-B', 'UI-A'], ['UI-A', 'UI-B', 'UI-C']],
+      ['Status', ['UI-A', 'UI-B', 'UI-C'], ['UI-C', 'UI-B', 'UI-A']],
+      ['Assignee', ['UI-A', 'UI-B', 'UI-C'], ['UI-C', 'UI-B', 'UI-A']],
+      ['Priority', ['UI-A', 'UI-B', 'UI-C'], ['UI-C', 'UI-A', 'UI-B']],
+      ['Updated', ['UI-A', 'UI-B', 'UI-C'], ['UI-C', 'UI-B', 'UI-A']],
+      ['Deps', ['UI-A', 'UI-B', 'UI-C'], ['UI-C', 'UI-A', 'UI-B']]
+    ];
+
+    for (const [label, first_order, second_order] of cases) {
+      const button = /** @type {HTMLButtonElement} */ (
+        mount.querySelector(`button[aria-label="Sort by ${label}"]`)
+      );
+      button.click();
+      expect(rowIds(), `${label} first direction`).toEqual(first_order);
+      button.click();
+      expect(rowIds(), `${label} second direction`).toEqual(second_order);
+    }
+
+    expect(mount.querySelectorAll('th[aria-sort]')).toHaveLength(8);
   });
 
   test('offers contextual empty-state actions', async () => {
@@ -859,7 +927,6 @@ describe('views/list', () => {
     const view = createListView(
       mount,
       async () => [],
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -907,7 +974,6 @@ describe('views/list', () => {
       async () => [],
       undefined,
       undefined,
-      undefined,
       issueStores
     );
     await view.load();
@@ -944,6 +1010,7 @@ describe('views/list', () => {
       type: 'snapshot',
       id: 'tab:issues',
       revision: 1,
+      truncated: true,
       issues: Array.from({ length: 1000 }, (_, index) => ({
         id: `UI-${index}`,
         title: `Issue ${index}`
@@ -967,14 +1034,13 @@ describe('views/list', () => {
       async () => [],
       undefined,
       store,
-      undefined,
       issueStores
     );
 
     await view.load();
 
     expect(mount.querySelector('.list-boundary-notice')?.textContent).toContain(
-      'Showing up to 1000 issues'
+      'Showing the first 1000 issues'
     );
   });
 
@@ -997,7 +1063,6 @@ describe('views/list', () => {
     const view = createListView(
       mount,
       async () => [],
-      undefined,
       undefined,
       undefined,
       issueStores
@@ -1042,7 +1107,6 @@ describe('views/list', () => {
       async () => [],
       undefined,
       undefined,
-      undefined,
       issueStores
     );
     await view.load();
@@ -1059,5 +1123,45 @@ describe('views/list', () => {
     toggleFilter(mount, 0, 'Open');
     await Promise.resolve();
     expect(mount.querySelectorAll('tr.issue-row').length).toBe(2);
+  });
+
+  test('warns that search and filters cover only exact truncated results', async () => {
+    document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const issueStores = createTestIssueStores();
+    const issue_store = issueStores.getStore('tab:issues');
+    issue_store.applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 1,
+      issues: [{ id: 'UI-1', title: 'Loaded issue', status: 'open' }],
+      truncated: true
+    });
+    const view = createListView(
+      mount,
+      async () => [],
+      undefined,
+      undefined,
+      issueStores
+    );
+
+    await view.load();
+
+    const boundary_text = mount
+      .querySelector('.list-boundary-notice')
+      ?.textContent?.replace(/\s+/g, ' ');
+    expect(boundary_text).toContain(
+      'Search and filters apply only to these loaded results'
+    );
+    issue_store.applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 2,
+      issues: [{ id: 'UI-1', title: 'Loaded issue', status: 'open' }],
+      truncated: false
+    });
+    await Promise.resolve();
+
+    expect(mount.querySelector('.list-boundary-notice')).toBeNull();
   });
 });

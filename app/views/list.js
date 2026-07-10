@@ -9,8 +9,11 @@ import { createIssueRowRenderer } from './issue-row.js';
 
 // List view implementation; requires a transport send function.
 
+export const ISSUES_SEGMENT_SIZE = 200;
+
 /**
- * @typedef {{ id: string, title?: string, status?: 'closed'|'open'|'in_progress', priority?: number, issue_type?: string, assignee?: string, labels?: string[], updated_at?: string | number }} Issue
+ * @typedef {{ id: string, title?: string, status?: 'closed'|'open'|'in_progress', priority?: number, issue_type?: string, assignee?: string, labels?: string[], dependency_count?: number, dependent_count?: number, updated_at?: string | number }} Issue
+ * @typedef {'id'|'type'|'title'|'status'|'assignee'|'priority'|'updated'|'dependencies'} SortKey
  */
 
 /**
@@ -20,9 +23,8 @@ import { createIssueRowRenderer } from './issue-row.js';
  * @param {(type: string, payload?: unknown) => Promise<unknown>} sendFn - RPC transport.
  * @param {(hash: string) => void} [navigate_fn] - Navigation function (defaults to setting location.hash).
  * @param {{ getState: () => any, setState: (patch: any) => void, subscribe: (fn: (s:any)=>void)=>()=>void }} [store] - Optional state store.
- * @param {{ selectors: { getIds: (client_id: string) => string[] } }} [_subscriptions]
- * @param {{ snapshotFor?: (client_id: string) => any[], subscribe?: (fn: () => void) => () => void }} [issueStores]
- * @returns {{ load: () => Promise<void>, destroy: () => void }} View API.
+ * @param {{ snapshotFor?: (client_id: string) => any[], subscribe?: (fn: () => void) => () => void, getStore?: (client_id: string) => unknown }} [issueStores]
+ * @returns {{ load: () => Promise<void>, focusSearch: () => boolean, destroy: () => void }} View API.
  */
 /**
  * Create the Issues List view.
@@ -31,21 +33,17 @@ import { createIssueRowRenderer } from './issue-row.js';
  * @param {(type: string, payload?: unknown) => Promise<unknown>} sendFn
  * @param {(hash: string) => void} [navigateFn]
  * @param {{ getState: () => any, setState: (patch: any) => void, subscribe: (fn: (s:any)=>void)=>()=>void }} [store]
- * @param {{ selectors: { getIds: (client_id: string) => string[] } }} [_subscriptions]
- * @param {{ snapshotFor?: (client_id: string) => any[], subscribe?: (fn: () => void) => () => void }} [issue_stores]
- * @returns {{ load: () => Promise<void>, destroy: () => void }}
+ * @param {{ snapshotFor?: (client_id: string) => any[], subscribe?: (fn: () => void) => () => void, getStore?: (client_id: string) => unknown }} [issue_stores]
+ * @returns {{ load: () => Promise<void>, focusSearch: () => boolean, destroy: () => void }}
  */
 export function createListView(
   mount_element,
   sendFn,
   navigateFn,
   store,
-  _subscriptions = undefined,
   issue_stores = undefined
 ) {
   const log = debug('views:list');
-  // Touch unused param to satisfy lint rules without impacting behavior
-  /** @type {any} */ (void _subscriptions);
   /** @type {string[]} */
   let status_filters = [];
   /** @type {string} */
@@ -62,12 +60,41 @@ export function createListView(
   let unsubscribe = null;
   let status_dropdown_open = false;
   let type_dropdown_open = false;
-  /** @type {'priority'|'updated'|null} */
+  /** @type {SortKey|null} */
   let sort_key = null;
   /** @type {'asc'|'desc'} */
   let sort_direction = 'asc';
   /** @type {ReturnType<typeof setTimeout> | null} */
   let search_timer = null;
+  let visible_limit = ISSUES_SEGMENT_SIZE;
+  const can_track_subscription_identity =
+    typeof issue_stores?.getStore === 'function';
+  let subscription_identity = can_track_subscription_identity
+    ? issue_stores.getStore?.('tab:issues')
+    : undefined;
+
+  function resetVisibleLimit() {
+    visible_limit = ISSUES_SEGMENT_SIZE;
+  }
+
+  function resetForSubscriptionIdentityChange() {
+    if (!can_track_subscription_identity) {
+      return;
+    }
+    const next_identity = issue_stores?.getStore?.('tab:issues');
+    if (next_identity !== subscription_identity) {
+      subscription_identity = next_identity;
+      resetVisibleLimit();
+    }
+  }
+
+  /** Return exact server truncation metadata without inferring from row count. */
+  function isIssueListTruncated() {
+    const issue_store = /** @type {any} */ (
+      issue_stores?.getStore?.('tab:issues')
+    );
+    return issue_store?.truncation?.() === true;
+  }
 
   /**
    * Normalize legacy string filter to array format.
@@ -127,6 +154,7 @@ export function createListView(
     if (store) {
       store.setState({ filters: { status: status_filters } });
     }
+    resetVisibleLimit();
     await load();
   };
 
@@ -149,6 +177,7 @@ export function createListView(
       if (store) {
         store.setState({ filters: { search: search_text } });
       }
+      resetVisibleLimit();
       doRender();
     }, 120);
   };
@@ -168,6 +197,7 @@ export function createListView(
     if (store) {
       store.setState({ filters: { type: type_filters } });
     }
+    resetVisibleLimit();
     doRender();
   };
 
@@ -224,15 +254,16 @@ export function createListView(
   const selectors = issue_stores ? createListSelectors(issue_stores) : null;
 
   /**
-   * @param {'priority'|'updated'} key
+   * @param {SortKey} key
    */
   function toggleSort(key) {
     if (sort_key === key) {
       sort_direction = sort_direction === 'asc' ? 'desc' : 'asc';
     } else {
       sort_key = key;
-      sort_direction = key === 'priority' ? 'asc' : 'desc';
+      sort_direction = key === 'updated' ? 'desc' : 'asc';
     }
+    resetVisibleLimit();
     doRender();
   }
 
@@ -250,24 +281,83 @@ export function createListView(
     return Number.isNaN(parsed) ? 0 : parsed;
   }
 
+  const STATUS_SORT_ORDER = Object.freeze({
+    open: 0,
+    in_progress: 1,
+    closed: 2
+  });
+
+  /**
+   * @param {Issue} issue
+   * @param {SortKey} key
+   * @returns {string | number}
+   */
+  function sortValue(issue, key) {
+    switch (key) {
+      case 'id':
+        return issue.id.toLocaleLowerCase();
+      case 'type':
+        return String(issue.issue_type || '').toLocaleLowerCase();
+      case 'title':
+        return String(issue.title || '').toLocaleLowerCase();
+      case 'status':
+        return STATUS_SORT_ORDER[issue.status || 'open'];
+      case 'assignee':
+        return String(issue.assignee || '').toLocaleLowerCase();
+      case 'priority':
+        return issue.priority ?? 2;
+      case 'updated':
+        return updatedValue(issue);
+      case 'dependencies':
+        return (
+          Number(issue.dependency_count || 0) +
+          Number(issue.dependent_count || 0)
+        );
+    }
+  }
+
   /**
    * @param {Issue[]} issues
    */
   function sortIssues(issues) {
-    if (!sort_key) {
+    const active_sort_key = sort_key;
+    if (!active_sort_key) {
       return issues;
     }
     const direction = sort_direction === 'asc' ? 1 : -1;
     return issues.slice().sort((a, b) => {
-      const a_value =
-        sort_key === 'priority' ? (a.priority ?? 2) : updatedValue(a);
-      const b_value =
-        sort_key === 'priority' ? (b.priority ?? 2) : updatedValue(b);
+      const a_value = sortValue(a, active_sort_key);
+      const b_value = sortValue(b, active_sort_key);
       if (a_value !== b_value) {
         return (a_value < b_value ? -1 : 1) * direction;
       }
       return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     });
+  }
+
+  /**
+   * @param {SortKey} key
+   * @param {string} label
+   */
+  function sortHeader(key, label) {
+    const active = sort_key === key;
+    return html`<th
+      role="columnheader"
+      aria-sort=${active
+        ? sort_direction === 'asc'
+          ? 'ascending'
+          : 'descending'
+        : 'none'}
+    >
+      <button
+        type="button"
+        class="sort-header"
+        aria-label=${`Sort by ${label}`}
+        @click=${() => toggleSort(key)}
+      >
+        ${label}
+      </button>
+    </th>`;
   }
 
   function clearFilters() {
@@ -282,7 +372,41 @@ export function createListView(
     if (store) {
       store.setState({ filters: { status: [], type: [], search: '' } });
     }
+    resetVisibleLimit();
     void load();
+  }
+
+  /**
+   * Reveal one more bounded segment without disturbing the scroll position.
+   *
+   * @param {Event} event
+   */
+  function showMore(event) {
+    const trigger = /** @type {HTMLElement} */ (event.currentTarget);
+    const restore_trigger_focus = trigger === document.activeElement;
+    const list_root = /** @type {HTMLElement | null} */ (
+      mount_element.querySelector('#list-root')
+    );
+    const previous_scroll = list_root?.scrollTop ?? 0;
+    visible_limit += ISSUES_SEGMENT_SIZE;
+    doRender();
+    const next_root = /** @type {HTMLElement | null} */ (
+      mount_element.querySelector('#list-root')
+    );
+    if (next_root) {
+      next_root.scrollTop = previous_scroll;
+    }
+    const next_trigger = /** @type {HTMLElement | null} */ (
+      mount_element.querySelector('.progressive-list__more')
+    );
+    if (next_trigger && restore_trigger_focus) {
+      next_trigger.focus();
+    } else if (restore_trigger_focus) {
+      const status = /** @type {HTMLElement | null} */ (
+        mount_element.querySelector('.progressive-list__status')
+      );
+      status?.focus();
+    }
   }
 
   function openCreateIssue() {
@@ -322,6 +446,10 @@ export function createListView(
       );
     }
     filtered = sortIssues(filtered);
+    const total_count = filtered.length;
+    const visible = filtered.slice(0, visible_limit);
+    const visible_count = visible.length;
+    const has_more = visible_count < total_count;
     const has_active_filters =
       status_filters.length > 0 ||
       type_filters.length > 0 ||
@@ -382,17 +510,20 @@ export function createListView(
           </div>
         </div>
         <input
+          id="issues-search"
           type="search"
           placeholder="Search…"
           aria-label="Search issues by ID, title, assignee, or label"
+          aria-keyshortcuts="/"
           @input=${onSearchInput}
           .value=${search_draft}
         />
       </div>
       <div class="panel__body" id="list-root">
-        ${issues_cache.length >= 1000
+        ${isIssueListTruncated()
           ? html`<div class="list-boundary-notice" role="status">
-              Showing up to 1000 issues.
+              Showing the first ${issues_cache.length} issues. Search and
+              filters apply only to these loaded results.
             </div>`
           : null}
         ${filtered.length === 0
@@ -418,7 +549,7 @@ export function createListView(
               <table
                 class="table"
                 role="grid"
-                aria-rowcount=${String(filtered.length)}
+                aria-rowcount=${String(total_count + 1)}
                 aria-colcount="8"
               >
                 <colgroup>
@@ -432,51 +563,47 @@ export function createListView(
                   <col style="width: 80px" />
                 </colgroup>
                 <thead>
-                  <tr role="row">
-                    <th role="columnheader">ID</th>
-                    <th role="columnheader">Type</th>
-                    <th role="columnheader">Title</th>
-                    <th role="columnheader">Status</th>
-                    <th role="columnheader">Assignee</th>
-                    <th
-                      role="columnheader"
-                      aria-sort=${sort_key === 'priority'
-                        ? sort_direction === 'asc'
-                          ? 'ascending'
-                          : 'descending'
-                        : 'none'}
-                    >
-                      <button
-                        type="button"
-                        class="sort-header"
-                        @click=${() => toggleSort('priority')}
-                      >
-                        Priority
-                      </button>
-                    </th>
-                    <th
-                      role="columnheader"
-                      aria-sort=${sort_key === 'updated'
-                        ? sort_direction === 'asc'
-                          ? 'ascending'
-                          : 'descending'
-                        : 'none'}
-                    >
-                      <button
-                        type="button"
-                        class="sort-header"
-                        @click=${() => toggleSort('updated')}
-                      >
-                        Updated
-                      </button>
-                    </th>
-                    <th role="columnheader">Deps</th>
+                  <tr role="row" aria-rowindex="1">
+                    ${sortHeader('id', 'ID')} ${sortHeader('type', 'Type')}
+                    ${sortHeader('title', 'Title')}
+                    ${sortHeader('status', 'Status')}
+                    ${sortHeader('assignee', 'Assignee')}
+                    ${sortHeader('priority', 'Priority')}
+                    ${sortHeader('updated', 'Updated')}
+                    ${sortHeader('dependencies', 'Deps')}
                   </tr>
                 </thead>
                 <tbody role="rowgroup">
-                  ${repeat(filtered, (it) => it.id, row_renderer)}
+                  ${repeat(visible, (it) => it.id, row_renderer)}
                 </tbody>
               </table>
+              <div class="progressive-list">
+                <div
+                  class="progressive-list__status"
+                  id="issues-visible-status"
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                  tabindex="-1"
+                >
+                  Showing ${visible_count} of ${total_count} issues
+                </div>
+                ${has_more
+                  ? html`<button
+                      type="button"
+                      class="progressive-list__more"
+                      aria-describedby="issues-visible-status"
+                      @click=${showMore}
+                    >
+                      Show
+                      ${Math.min(
+                        ISSUES_SEGMENT_SIZE,
+                        total_count - visible_count
+                      )}
+                      more
+                    </button>`
+                  : null}
+              </div>
             </div>`}
       </div>
     `;
@@ -487,6 +614,10 @@ export function createListView(
    */
   function doRender() {
     render(template(), mount_element);
+    const rows = mount_element.querySelectorAll('tbody tr.issue-row');
+    rows.forEach((row, index) => {
+      row.setAttribute('aria-rowindex', String(index + 2));
+    });
   }
 
   // Initial render (header + body shell with current state)
@@ -532,6 +663,7 @@ export function createListView(
    */
   async function load() {
     log('load');
+    resetForSubscriptionIdentityChange();
     // Preserve scroll position to avoid jarring jumps on live refresh
     const beforeEl = /** @type {HTMLElement|null} */ (
       mount_element.querySelector('#list-root')
@@ -702,6 +834,7 @@ export function createListView(
           JSON.stringify(next_status) !== JSON.stringify(status_filters);
         if (status_changed) {
           status_filters = next_status;
+          resetVisibleLimit();
           // Reload on any status scope change to keep cache correct
           void load();
           return;
@@ -709,6 +842,7 @@ export function createListView(
         if (next_search !== search_text) {
           search_text = next_search;
           search_draft = next_search;
+          resetVisibleLimit();
           needs_render = true;
         }
         const next_type_arr = normalizeTypeFilter(s.filters.type);
@@ -716,6 +850,7 @@ export function createListView(
           JSON.stringify(next_type_arr) !== JSON.stringify(type_filters);
         if (type_changed) {
           type_filters = next_type_arr;
+          resetVisibleLimit();
           needs_render = true;
         }
         if (needs_render) {
@@ -731,6 +866,7 @@ export function createListView(
   if (selectors) {
     unsubscribe_selectors = selectors.subscribe(() => {
       try {
+        resetForSubscriptionIdentityChange();
         issues_cache = /** @type {Issue[]} */ (
           selectors.selectIssuesFor('tab:issues')
         );
@@ -743,6 +879,16 @@ export function createListView(
 
   return {
     load,
+    focusSearch() {
+      const input = /** @type {HTMLInputElement | null} */ (
+        mount_element.querySelector('#issues-search')
+      );
+      if (!input || input.disabled || !input.isConnected) {
+        return false;
+      }
+      input.focus();
+      return document.activeElement === input;
+    },
     destroy() {
       mount_element.replaceChildren();
       if (search_timer) {

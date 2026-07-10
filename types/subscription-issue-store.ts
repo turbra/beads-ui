@@ -30,10 +30,15 @@ export interface SubscriptionIssueStore {
   subscribe(listener: () => void): () => void;
 
   /**
-   * Apply a push message (snapshot, upsert, delete). The store must be
+   * Apply a push message (snapshot, upsert, delete, or delta). The store must be
    * idempotent and ignore stale updates using `revision` and `updated_at`.
    */
-  applyPush(msg: SnapshotMsg | UpsertMsg | DeleteMsg): void;
+  applyPush(
+    msg: SnapshotMsg | UpsertMsg | DeleteMsg | DeltaMsg
+  ): PushApplyResult;
+
+  /** Reject incrementals until a fresh snapshot restores synchronization. */
+  requireResync(): 'ignored' | 'resync-needed';
 
   /**
    * Seed with already-loaded list data without advancing the server revision.
@@ -43,6 +48,9 @@ export interface SubscriptionIssueStore {
 
   /** Stable, read-only snapshot of issues for rendering. */
   snapshot(): readonly Issue[];
+
+  /** Exact server truncation state; null means an older server did not report it. */
+  truncation(): boolean | null;
 
   /** Convenience helpers for tests and lookups. */
   size(): number;
@@ -62,6 +70,7 @@ export type SnapshotMsg = {
   id: string;
   revision: number;
   issues: Issue[];
+  truncated?: boolean;
 };
 
 export type UpsertMsg = {
@@ -77,3 +86,13 @@ export type DeleteMsg = {
   revision: number;
   issue_id: string;
 };
+
+export type DeltaMsg = {
+  type: 'delta';
+  id: string;
+  revision: number;
+  upserts: Issue[];
+  deletes: string[];
+};
+
+export type PushApplyResult = 'applied' | 'ignored' | 'resync-needed';

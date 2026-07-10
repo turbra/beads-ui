@@ -19,6 +19,7 @@
   },
   "scripts": {
     "all": "npm run lint && npm run tsc && npm test && npm run prettier:check",
+    "benchmark:large-lists": "node --expose-gc scripts/benchmark-large-lists.js",
     "start": "node server/index.js --debug",
     "build": "node scripts/build-frontend.js",
     "test": "vitest run",

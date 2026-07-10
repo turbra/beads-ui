@@ -3,8 +3,31 @@ import { debug } from './logging.js';
 
 const log = debug('list-adapters');
 
-export const SUBSCRIPTION_LIST_LIMIT = 1000;
-const SUBSCRIPTION_LIST_FETCH_LIMIT = SUBSCRIPTION_LIST_LIMIT + 1;
+export const BOARD_SUBSCRIPTION_LIST_LIMIT = 1000;
+export const ISSUES_SUBSCRIPTION_LIST_LIMIT = 1000;
+export const ISSUES_SUBSCRIPTION_LIST_HARD_MAX = 10000;
+// Compatibility export for callers that only need the current default.
+export const SUBSCRIPTION_LIST_LIMIT = BOARD_SUBSCRIPTION_LIST_LIMIT;
+const ISSUES_CLIENT_TYPES = new Set([
+  'all-issues',
+  'issues-ready',
+  'status-issues'
+]);
+
+/**
+ * Keep Issues and Board policy independent even while both use the evidence-
+ * approved 1,000-item tier.
+ *
+ * @param {{ type: string }} spec
+ */
+export function subscriptionListLimit(spec) {
+  return ISSUES_CLIENT_TYPES.has(String(spec.type))
+    ? Math.min(
+        ISSUES_SUBSCRIPTION_LIST_LIMIT,
+        ISSUES_SUBSCRIPTION_LIST_HARD_MAX
+      )
+    : BOARD_SUBSCRIPTION_LIST_LIMIT;
+}
 
 /**
  * Build concrete `bd` CLI args for a subscription type + params.
@@ -15,15 +38,10 @@ const SUBSCRIPTION_LIST_FETCH_LIMIT = SUBSCRIPTION_LIST_LIMIT + 1;
  */
 export function mapSubscriptionToBdArgs(spec) {
   const t = String(spec.type);
+  const fetch_limit = subscriptionListLimit(spec) + 1;
   switch (t) {
     case 'all-issues': {
-      return [
-        'list',
-        '--json',
-        '--tree=false',
-        '--limit',
-        String(SUBSCRIPTION_LIST_FETCH_LIMIT)
-      ];
+      return ['list', '--json', '--tree=false', '--limit', String(fetch_limit)];
     }
     case 'epics': {
       return ['epic', 'status', '--json'];
@@ -31,13 +49,9 @@ export function mapSubscriptionToBdArgs(spec) {
     case 'blocked-issues': {
       return ['blocked', '--json'];
     }
+    case 'issues-ready':
     case 'ready-issues': {
-      return [
-        'ready',
-        '--limit',
-        String(SUBSCRIPTION_LIST_FETCH_LIMIT),
-        '--json'
-      ];
+      return ['ready', '--limit', String(fetch_limit), '--json'];
     }
     case 'in-progress-issues': {
       return [
@@ -47,7 +61,7 @@ export function mapSubscriptionToBdArgs(spec) {
         '--status',
         'in_progress',
         '--limit',
-        String(SUBSCRIPTION_LIST_FETCH_LIMIT)
+        String(fetch_limit)
       ];
     }
     case 'status-issues': {
@@ -62,7 +76,7 @@ export function mapSubscriptionToBdArgs(spec) {
         '--status',
         statuses,
         '--limit',
-        String(SUBSCRIPTION_LIST_FETCH_LIMIT)
+        String(fetch_limit)
       ];
     }
     case 'closed-issues': {
@@ -73,7 +87,7 @@ export function mapSubscriptionToBdArgs(spec) {
         '--status',
         'closed',
         '--limit',
-        String(SUBSCRIPTION_LIST_FETCH_LIMIT)
+        String(fetch_limit)
       ];
       const since =
         typeof spec.params?.since === 'number' ? spec.params.since : 0;
@@ -246,7 +260,7 @@ export async function fetchListForSubscription(spec, options = {}) {
 
     const normalized_items = normalizeIssueList(raw);
     const is_detail = String(spec.type) === 'issue-detail';
-    const limit = is_detail ? 1 : SUBSCRIPTION_LIST_LIMIT;
+    const limit = is_detail ? 1 : subscriptionListLimit(spec);
     const truncated = !is_detail && normalized_items.length > limit;
     const items = normalized_items.slice(0, limit);
     return { ok: true, items, truncated };

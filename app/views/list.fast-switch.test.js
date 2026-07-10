@@ -85,7 +85,6 @@ describe('list view — fast filter switches', () => {
       async () => [],
       undefined,
       undefined,
-      undefined,
       issueStores
     );
     await view.load();

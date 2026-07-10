@@ -59,14 +59,7 @@ describe('views/board keyboard navigation', () => {
       issues
     });
 
-    const view = createBoardView(
-      mount,
-      null,
-      () => {},
-      undefined,
-      undefined,
-      issueStores
-    );
+    const view = createBoardView(mount, () => {}, undefined, issueStores);
     await view.load();
 
     const first = /** @type {HTMLElement} */ (
@@ -116,11 +109,9 @@ describe('views/board keyboard navigation', () => {
     const opened = [];
     const view = createBoardView(
       mount,
-      null,
       (id) => {
         opened.push(id);
       },
-      undefined,
       undefined,
       issueStores
     );
