@@ -2,7 +2,8 @@
 
 ```
 Date: 2025-10-26
-Status: Proposed (ready for owner approval)
+Amended: 2026-07-10
+Status: Accepted; subscription-delta-v1 amendment accepted, implementation pending
 Owner: agent
 ```
 
@@ -23,35 +24,59 @@ issue objects for correctness and to avoid fan‑out to a central cache.
   client’s subscription id.
 - Server sends per‑subscription full‑issue payloads only; no id‑only deltas.
   Messages are serialized per subscription and revisioned.
+- Add `subscription-delta-v1` as an optional delivery capability. Capable
+  subscriptions receive one atomic full-issue `delta` for refreshes with two or
+  more changes. Missing or unsupported capabilities retain full-issue
+  `upsert`/`delete` delivery.
+- Bound the additive protocol at the server boundary: 128 UTF-8 bytes per client
+  subscription id, 8 capability tokens, 32 active subscriptions per connection,
+  a finite server-owned list ceiling, and 8 MiB defaults for maximum encoded
+  push frame and socket high-water mark. Pending initial fetches reserve a
+  subscription slot. Backpressure closes and resynchronizes the connection
+  rather than dropping incremental frames.
 - Lists render exclusively from their own store snapshots; the central issue
   cache is removed from the list render path.
 - Breaking change: remove legacy id‑only list deltas and any compatibility
-  paths/flags. No phased rollout and no telemetry collection.
+  paths/flags. The delta capability does not restore that old protocol; it is an
+  additive optimization within the full-issue v2 model.
 
 ## Protocol (Server → Client)
 
-Message shapes are defined in `types/subscriptions.ts` and documented in
-`docs/data-exchange-subscription-plan.md`.
+Base runtime message shapes are defined in `types/subscriptions.ts`. The
+accepted delta target below is normative for `beads-ui-tyx.2` and
+`beads-ui-tyx.3`; those implementation tasks add it to the runtime types.
+`docs/protocol/issues-push-v2.md` is the complete wire contract.
 
-All envelopes include a version tag and a per‑subscription, strictly monotonic
-`revision` used for ordering and replay protection (see UI‑144).
+Push envelopes include a per‑subscription, strictly monotonic `revision` used
+for ordering and replay protection. The versioned `subscription-delta-v1`
+capability applies only to delivery selection.
 
-- `subscribed` `{ id: string }`
-- `snapshot` `{ id: string, revision: number, issues: Issue[] }`
+- `subscribe-list` reply `{ id: string, key: string, capabilities: string[] }`
+- `snapshot`
+  `{ id: string, revision: number, issues: Issue[], truncated?: boolean }`
 - `upsert` `{ id: string, revision: number, issue: Issue }`
 - `delete` `{ id: string, revision: number, issue_id: string }`
+- `delta`
+  `{ id: string, revision: number, upserts: Issue[], deletes: string[] }`
 - `error` `{ id?: string, code: string, message: string, details?: object }`
 
 Notes
 
-- Per‑subscription ordering is guaranteed by the server and signaled via
-  `revision`. Clients MUST apply envelopes in `revision` order and ignore any
-  envelope whose `revision` is ≤ the last applied.
+- Ordering is guaranteed by a key-scoped counter on one connection and signaled
+  via `revision`. Client ids sharing a key may observe gaps or different initial
+  values. Each client store MUST apply its observed envelopes in increasing
+  order and ignore any envelope whose `revision` is ≤ the last applied.
 - Clients MUST treat updates as idempotent and MAY additionally guard on an
   `issue.updated_at` timestamp to ignore stale `upsert`s that race with local
   state. Timestamps are advisory; `revision` is canonical for ordering.
 - Initial state arrives as a `snapshot` with a complete list of issues for the
-  subscription key.
+  bounded subscription key. New servers add exact `truncated` metadata; older
+  servers omit it.
+- A delta is one atomic revision. Upsert and delete ids are unique and disjoint.
+  Clients validate the complete delta before mutation, sort and notify once, and
+  re-subscribe for a fresh snapshot if validation fails.
+- The server selects delta delivery per client subscription id, not per shared
+  registry key. Capable and legacy ids may share the same fetched result.
 
 ## Client Store API
 
@@ -66,8 +91,8 @@ export interface SubscriptionIssueStore {
   /** Attach a listener that is called after each applied message. */
   subscribe(listener: () => void): () => void;
 
-  /** Apply a push message: snapshot, upsert, or delete. */
-  applyPush(msg: SnapshotMsg | UpsertMsg | DeleteMsg): void;
+  /** Apply a push message: snapshot, upsert, delete, or atomic delta. */
+  applyPush(msg: SnapshotMsg | UpsertMsg | DeleteMsg | DeltaMsg): void;
 
   /** Read-only, stable snapshot for rendering (deterministic sort). */
   snapshot(): readonly Issue[];
@@ -85,6 +110,7 @@ export type SnapshotMsg = {
   id: string;
   revision: number;
   issues: Issue[];
+  truncated?: boolean;
 };
 
 export type UpsertMsg = {
@@ -100,6 +126,14 @@ export type DeleteMsg = {
   revision: number;
   issue_id: string;
 };
+
+export type DeltaMsg = {
+  type: 'delta';
+  id: string;
+  revision: number;
+  upserts: Issue[];
+  deletes: string[];
+};
 ```
 
 ### Sorting and identity
@@ -113,6 +147,8 @@ export type DeleteMsg = {
 
 - On disconnect/reconnect, the client creates a fresh store and re‑subscribes.
   The server sends a fresh snapshot; no attempt is made to diff across sessions.
+  The store resets revision state because the new connection restarts each
+  key-scoped counter.
 
 ### Reconcile algorithm (pseudo‑code)
 
@@ -122,7 +158,11 @@ lastRevision: number = 0
 
 function applyPush(msg) {
   if (msg.revision <= lastRevision) return // stale or duplicate
-  lastRevision = msg.revision
+  if (msg.type === 'delta' && !isCompleteValidDelta(msg)) {
+    markDesynchronized()
+    resubscribeForSnapshot()
+    return
+  }
 
   switch (msg.type) {
     case 'snapshot':
@@ -140,8 +180,18 @@ function applyPush(msg) {
     case 'delete':
       state.delete(msg.issue_id)
       break
+    case 'delta':
+      for (const it of msg.upserts) {
+        upsertWithIdentityAndTimestampGuard(state, it)
+      }
+      for (const id of msg.deletes) {
+        state.delete(id)
+      }
+      break
   }
-  notifyListeners()
+  lastRevision = msg.revision
+  sortOnceIfDirty()
+  notifyListenersOnce()
 }
 ```
 
@@ -153,11 +203,14 @@ the same `id` whenever fields change.
 
 - Delete list render paths that read via the central issues cache.
 - Introduce a factory `createSubscriptionIssueStore(id)` at view mount; wire the
-  push client to route `snapshot`/`upsert`/`delete` messages by `id` to the
-  corresponding store via `applyPush`.
+  push client to route `snapshot`/`upsert`/`delete` and accepted `delta`
+  messages by `id` to the corresponding store via `applyPush`.
 - Update list components to render from `store.snapshot()` and subscribe to
   re‑render on changes.
 - Remove legacy central‑store fan‑out and dead selectors.
+- Add a bounded top-level `capabilities` array to `subscribe-list`. Keep it out
+  of subscription `params` and keys. Re-send the capability on reconnect and
+  keep legacy handlers active.
 
 ## Consequences
 
@@ -167,12 +220,16 @@ Pros
   testing.
 - No cache fan‑out; updates apply once per subscription and render once.
 - Clearer ownership boundaries; easier disposal on route/tab changes.
+- Bulk refreshes collapse many WebSocket tasks, sorts, and renders into one
+  atomic delivery for capable subscriptions.
 
 Cons / Risks
 
 - Larger `updated` payloads vs id‑only membership deltas. Mitigated by
   per‑subscription scoping and batching.
 - Requires coordinated server/client cutover due to the breaking change.
+- The additive delta path permanently retains full-issue `upsert` and `delete`
+  fallback within protocol v2. This adds a small compatibility test matrix.
 
 ## Alternatives Considered
 
@@ -180,8 +237,11 @@ Cons / Risks
   ownership, increases complexity and test surface, caused known ordering bugs.
 - Maintain id‑only list deltas with separate issue fetches. Rejected: adds
   round‑trips and cross‑store coordination; does not meet simplicity goal.
-- Dual protocol/feature flag with gradual cutover. Rejected per epic scope: no
-  flags, no compatibility layer, and no telemetry collection.
+- Dual old/new data models with gradual cutover. Rejected: id-only deltas,
+  notify-then-fetch, and central-cache fan-out remain removed.
+- Additive full-issue delta capability. Accepted: it changes only delivery
+  granularity, uses the same subscription membership and issue payloads, and
+  safely falls back when either peer lacks support.
 
 ## Related
 
@@ -194,7 +254,10 @@ Cons / Risks
 
 ## Status & Follow‑ups
 
-- This ADR is a breaking change with no flags/compat/telemetry. It becomes
-  Accepted once UI‑166 is approved by frontend and backend owners and the
-  server/client work (UI‑167, UI‑168, UI‑169) lands.
-- Cleanup (UI-174) removes the central store and delta fan‑out code.
+- The per-subscription full-issue store decision is implemented and accepted.
+- The `subscription-delta-v1` amendment is accepted as the compatibility
+  contract. Server implementation is complete in `beads-ui-tyx.2`; client
+  implementation is tracked by `beads-ui-tyx.3`, and integration and
+  compatibility validation are tracked by `beads-ui-tyx.4`.
+- Legacy full-issue `upsert` and `delete` remain supported for protocol v2.
+  Removing them requires a new major protocol ADR and migration plan.

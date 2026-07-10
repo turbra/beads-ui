@@ -49,10 +49,55 @@ export function subKeyOf(spec) {
  */
 export function createSubscriptionStore(send) {
   const log = debug('subs');
-  /** @type {Map<string, { key: string, itemsById: Map<string, true> }>} */
+  /** @type {Map<string, { key: string, itemsById: Map<string, true>, spec: Readonly<SubscriptionSpec> }>} */
   const subs_by_id = new Map();
   /** @type {Map<string, Set<string>>} */
   const ids_by_key = new Map();
+
+  /**
+   * @param {SubscriptionSpec} spec
+   * @returns {Readonly<SubscriptionSpec>}
+   */
+  function copySpec(spec) {
+    const params = spec.params ? Object.freeze({ ...spec.params }) : undefined;
+    return Object.freeze({ type: String(spec.type), params });
+  }
+
+  /**
+   * Return whether a failed subscribe request should remain eligible for
+   * automatic replay on the next connection.
+   *
+   * @param {unknown} err
+   */
+  function isReplayableTransportError(err) {
+    if (!err || typeof err !== 'object') {
+      return false;
+    }
+    const code = /** @type {{ code?: unknown }} */ (err).code;
+    return (
+      code === 'ws_disconnected' ||
+      code === 'ws_connection_failed' ||
+      code === 'ws_send_failed'
+    );
+  }
+
+  /**
+   * @param {string} client_id
+   * @param {{ key: string, itemsById: Map<string, true>, spec: Readonly<SubscriptionSpec> }} entry
+   */
+  function removeEntry(client_id, entry) {
+    if (subs_by_id.get(client_id) !== entry) {
+      return;
+    }
+    subs_by_id.delete(client_id);
+    const subscribers = ids_by_key.get(entry.key);
+    if (subscribers) {
+      subscribers.delete(client_id);
+      if (subscribers.size === 0) {
+        ids_by_key.delete(entry.key);
+      }
+    }
+  }
 
   /**
    * Apply a delta to all client ids mapped to a given key.
@@ -110,25 +155,17 @@ export function createSubscriptionStore(send) {
    * @returns {Promise<() => Promise<void>>}
    */
   async function subscribeList(client_id, spec) {
-    const key = subKeyOf(spec);
+    const saved_spec = copySpec(spec);
+    const key = subKeyOf(saved_spec);
     log('subscribe %s key=%s', client_id, key);
-    // Initialize local entry immediately to capture early deltas
-    if (!subs_by_id.has(client_id)) {
-      subs_by_id.set(client_id, { key, itemsById: new Map() });
-    } else {
-      // Update key mapping if client id is reused for a different spec
-      const prev = subs_by_id.get(client_id);
-      if (prev && prev.key !== key) {
-        const prev_ids = ids_by_key.get(prev.key);
-        if (prev_ids) {
-          prev_ids.delete(client_id);
-          if (prev_ids.size === 0) {
-            ids_by_key.delete(prev.key);
-          }
-        }
-        subs_by_id.set(client_id, { key, itemsById: new Map() });
-      }
+    const previous = subs_by_id.get(client_id);
+    const items_by_id =
+      previous && previous.key === key ? previous.itemsById : new Map();
+    if (previous) {
+      removeEntry(client_id, previous);
     }
+    const entry = { key, itemsById: items_by_id, spec: saved_spec };
+    subs_by_id.set(client_id, entry);
     if (!ids_by_key.has(key)) {
       ids_by_key.set(key, new Set());
     }
@@ -136,47 +173,72 @@ export function createSubscriptionStore(send) {
     if (set) {
       set.add(client_id);
     }
-    try {
-      await send('subscribe-list', {
-        id: client_id,
-        type: spec.type,
-        params: spec.params
-      });
-    } catch (err) {
-      const entry = subs_by_id.get(client_id) || null;
-      if (entry) {
-        const subscribers = ids_by_key.get(entry.key);
-        if (subscribers) {
-          subscribers.delete(client_id);
-          if (subscribers.size === 0) {
-            ids_by_key.delete(entry.key);
-          }
-        }
-      }
-      subs_by_id.delete(client_id);
-      throw err;
-    }
 
-    return async () => {
+    const unsubscribe = async () => {
       log('unsubscribe %s key=%s', client_id, key);
+      if (subs_by_id.get(client_id) !== entry) {
+        return;
+      }
+      // Remove locally before awaiting the transport so late deltas and stale
+      // unsubscribe closures cannot affect a replacement subscription.
+      removeEntry(client_id, entry);
       try {
         await send('unsubscribe-list', { id: client_id });
       } catch {
         // ignore transport errors on unsubscribe
       }
-      // Cleanup local mappings
-      const entry = subs_by_id.get(client_id) || null;
-      if (entry) {
-        const s = ids_by_key.get(entry.key);
-        if (s) {
-          s.delete(client_id);
-          if (s.size === 0) {
-            ids_by_key.delete(entry.key);
-          }
-        }
-      }
-      subs_by_id.delete(client_id);
     };
+
+    try {
+      await send('subscribe-list', {
+        id: client_id,
+        type: saved_spec.type,
+        params: saved_spec.params
+      });
+    } catch (err) {
+      if (isReplayableTransportError(err)) {
+        log('retaining %s for reconnect replay after %o', client_id, err);
+        return unsubscribe;
+      }
+      removeEntry(client_id, entry);
+      throw err;
+    }
+
+    return unsubscribe;
+  }
+
+  /**
+   * Replay all active subscription specs after a reconnect.
+   *
+   * @returns {Promise<string[]>}
+   */
+  async function resubscribeAll() {
+    const entries = Array.from(subs_by_id.entries());
+    const results = await Promise.allSettled(
+      entries.map(([client_id, entry]) =>
+        send('subscribe-list', {
+          id: client_id,
+          type: entry.spec.type,
+          params: entry.spec.params
+        })
+      )
+    );
+    /** @type {string[]} */
+    const successful_ids = [];
+    /** @type {string[]} */
+    const failed_ids = [];
+    for (let index = 0; index < entries.length; index += 1) {
+      const client_id = entries[index][0];
+      if (results[index].status === 'fulfilled') {
+        successful_ids.push(client_id);
+      } else {
+        failed_ids.push(client_id);
+      }
+    }
+    if (failed_ids.length > 0) {
+      throw new Error(`Failed to resubscribe: ${failed_ids.join(', ')}`);
+    }
+    return successful_ids;
   }
 
   /**
@@ -242,6 +304,7 @@ export function createSubscriptionStore(send) {
 
   return {
     subscribeList,
+    resubscribeAll,
     // test/diagnostics helpers
     _applyDelta: applyDelta,
     _subKeyOf: subKeyOf,

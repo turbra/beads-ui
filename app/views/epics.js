@@ -4,7 +4,7 @@ import { createIssueIdRenderer } from '../utils/issue-id-renderer.js';
 import { createIssueRowRenderer } from './issue-row.js';
 
 /**
- * @typedef {{ id: string, title?: string, status?: string, priority?: number, issue_type?: string, assignee?: string, created_at?: number, updated_at?: number }} IssueLite
+ * @typedef {{ id: string, title?: string, status?: string, priority?: number, issue_type?: string, assignee?: string, created_at?: string | number, updated_at?: string | number }} IssueLite
  */
 
 /**
@@ -36,6 +36,10 @@ export function createEpicsView(
   const loading = new Set();
   /** @type {Map<string, () => Promise<void>>} */
   const epic_unsubs = new Map();
+  /** @type {'priority'|'updated'|null} */
+  let sort_key = null;
+  /** @type {'asc'|'desc'} */
+  let sort_direction = 'asc';
   // Centralized selection helpers
   const selectors = issue_stores ? createListSelectors(issue_stores) : null;
 
@@ -84,6 +88,53 @@ export function createEpicsView(
     render(template(), mount_element);
   }
 
+  /**
+   * @param {'priority'|'updated'} key
+   */
+  function toggleSort(key) {
+    if (sort_key === key) {
+      sort_direction = sort_direction === 'asc' ? 'desc' : 'asc';
+    } else {
+      sort_key = key;
+      sort_direction = key === 'priority' ? 'asc' : 'desc';
+    }
+    doRender();
+  }
+
+  /**
+   * @param {IssueLite} issue
+   */
+  function updatedValue(issue) {
+    if (issue.updated_at === undefined || issue.updated_at === null) {
+      return 0;
+    }
+    if (typeof issue.updated_at === 'number') {
+      return issue.updated_at;
+    }
+    const parsed = Date.parse(issue.updated_at);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+
+  /**
+   * @param {IssueLite[]} issues
+   */
+  function sortChildren(issues) {
+    if (!sort_key) {
+      return issues;
+    }
+    const direction = sort_direction === 'asc' ? 1 : -1;
+    return issues.slice().sort((a, b) => {
+      const a_value =
+        sort_key === 'priority' ? (a.priority ?? 2) : updatedValue(a);
+      const b_value =
+        sort_key === 'priority' ? (b.priority ?? 2) : updatedValue(b);
+      if (a_value !== b_value) {
+        return (a_value < b_value ? -1 : 1) * direction;
+      }
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+  }
+
   function template() {
     if (!groups.length) {
       return html`<div class="panel__header muted">No epics found.</div>`;
@@ -99,7 +150,9 @@ export function createEpicsView(
     const id = String(epic.id || '');
     const is_open = expanded.has(id);
     // Compose children via selectors
-    const list = selectors ? selectors.selectEpicChildren(id) : [];
+    const list = sortChildren(
+      selectors ? selectors.selectEpicChildren(id) : []
+    );
     const is_loading = loading.has(id);
     return html`
       <div class="epic-group" data-epic-id=${id}>
@@ -133,7 +186,12 @@ export function createEpicsView(
                 ? html`<div class="muted">Loading…</div>`
                 : list.length === 0
                   ? html`<div class="muted">No issues found</div>`
-                  : html`<table class="table">
+                  : html`<table
+                      class="table"
+                      role="grid"
+                      aria-rowcount=${String(list.length)}
+                      aria-colcount="8"
+                    >
                       <colgroup>
                         <col style="width: 100px" />
                         <col style="width: 120px" />
@@ -141,18 +199,52 @@ export function createEpicsView(
                         <col style="width: 120px" />
                         <col style="width: 160px" />
                         <col style="width: 130px" />
+                        <col style="width: 180px" />
+                        <col style="width: 80px" />
                       </colgroup>
                       <thead>
-                        <tr>
-                          <th>ID</th>
-                          <th>Type</th>
-                          <th>Title</th>
-                          <th>Status</th>
-                          <th>Assignee</th>
-                          <th>Priority</th>
+                        <tr role="row">
+                          <th role="columnheader">ID</th>
+                          <th role="columnheader">Type</th>
+                          <th role="columnheader">Title</th>
+                          <th role="columnheader">Status</th>
+                          <th role="columnheader">Assignee</th>
+                          <th
+                            role="columnheader"
+                            aria-sort=${sort_key === 'priority'
+                              ? sort_direction === 'asc'
+                                ? 'ascending'
+                                : 'descending'
+                              : 'none'}
+                          >
+                            <button
+                              type="button"
+                              class="sort-header"
+                              @click=${() => toggleSort('priority')}
+                            >
+                              Priority
+                            </button>
+                          </th>
+                          <th
+                            role="columnheader"
+                            aria-sort=${sort_key === 'updated'
+                              ? sort_direction === 'asc'
+                                ? 'ascending'
+                                : 'descending'
+                              : 'none'}
+                          >
+                            <button
+                              type="button"
+                              class="sort-header"
+                              @click=${() => toggleSort('updated')}
+                            >
+                              Updated
+                            </button>
+                          </th>
+                          <th role="columnheader">Deps</th>
                         </tr>
                       </thead>
-                      <tbody>
+                      <tbody role="rowgroup">
                         ${list.map((it) => renderRow(it))}
                       </tbody>
                     </table>`}
@@ -167,13 +259,7 @@ export function createEpicsView(
    * @param {{ [k: string]: any }} patch
    */
   async function updateInline(id, patch) {
-    try {
-      await data.updateIssue({ id, ...patch });
-      // Re-render; view will update on subsequent push
-      doRender();
-    } catch {
-      // swallow; UI remains
-    }
+    return data.updateIssue({ id, ...patch });
   }
 
   /**

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { createDetailView } from './detail.js';
 
 describe('views/detail', () => {
@@ -252,6 +252,127 @@ describe('views/detail', () => {
     const firstComment = commentItems[0];
     expect(firstComment.textContent).toContain('Alice');
     expect(firstComment.textContent).toContain('This is a comment');
+  });
+
+  test('renders sanitized comment markdown', async () => {
+    document.body.innerHTML =
+      '<section class="panel"><div id="mount"></div></section>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const issue = {
+      id: 'UI-99-MD',
+      title: 'Markdown comment',
+      dependencies: [],
+      dependents: [],
+      comments: [
+        {
+          id: 1,
+          author: 'Alice',
+          text: '**Important** <img src="x" onerror="alert(1)">',
+          created_at: '2025-01-15T10:30:00Z'
+        }
+      ]
+    };
+    const stores = {
+      snapshotFor(/** @type {string} */ id) {
+        return id === 'detail:UI-99-MD' ? [issue] : [];
+      },
+      subscribe() {
+        return () => {};
+      }
+    };
+    const view = createDetailView(mount, async () => ({}), undefined, stores);
+
+    await view.load('UI-99-MD');
+
+    const comment = /** @type {HTMLElement} */ (
+      mount.querySelector('.comment-text')
+    );
+    expect(comment.querySelector('strong')?.textContent).toBe('Important');
+    expect(comment.querySelector('img')?.hasAttribute('onerror')).toBe(false);
+  });
+
+  test('renders relative comment time with full timestamp metadata', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2025-01-15T12:30:00Z'));
+    try {
+      document.body.innerHTML =
+        '<section class="panel"><div id="mount"></div></section>';
+      const mount = /** @type {HTMLElement} */ (
+        document.getElementById('mount')
+      );
+      const issue = {
+        id: 'UI-99-TIME',
+        title: 'Comment time',
+        dependencies: [],
+        dependents: [],
+        comments: [
+          {
+            id: 1,
+            author: 'Alice',
+            text: 'Timestamped',
+            created_at: '2025-01-15T10:30:00Z'
+          }
+        ]
+      };
+      const stores = {
+        snapshotFor(/** @type {string} */ id) {
+          return id === 'detail:UI-99-TIME' ? [issue] : [];
+        },
+        subscribe() {
+          return () => {};
+        }
+      };
+      const view = createDetailView(mount, async () => ({}), undefined, stores);
+
+      await view.load('UI-99-TIME');
+
+      const time = /** @type {HTMLTimeElement} */ (
+        mount.querySelector('.comment-date')
+      );
+      expect(time.tagName).toBe('TIME');
+      expect(time.textContent).toBe('2h');
+      expect(time.dateTime).toBe('2025-01-15T10:30:00.000Z');
+      expect(time.title).not.toBe('');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('renders invalid comment timestamps as plain text', async () => {
+    document.body.innerHTML =
+      '<section class="panel"><div id="mount"></div></section>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const issue = {
+      id: 'UI-99-BAD-TIME',
+      title: 'Invalid comment time',
+      dependencies: [],
+      dependents: [],
+      comments: [
+        {
+          id: 1,
+          author: 'Alice',
+          text: 'Timestamped',
+          created_at: 'not-a-date'
+        }
+      ]
+    };
+    const stores = {
+      snapshotFor(/** @type {string} */ id) {
+        return id === 'detail:UI-99-BAD-TIME' ? [issue] : [];
+      },
+      subscribe() {
+        return () => {};
+      }
+    };
+    const view = createDetailView(mount, async () => ({}), undefined, stores);
+
+    await view.load('UI-99-BAD-TIME');
+
+    const date = /** @type {HTMLElement} */ (
+      mount.querySelector('.comment-date')
+    );
+    expect(date.tagName).toBe('SPAN');
+    expect(date.textContent).toBe('not-a-date');
   });
 
   test('shows placeholder when no comments', async () => {
@@ -546,10 +667,93 @@ describe('views/detail', () => {
 
       // Should show issue ID and title
       const message = dialog?.querySelector('.delete-confirm__message');
-      expect(message?.innerHTML).toContain('<strong>UI-100</strong>');
-      expect(message?.innerHTML).toContain(
-        '<strong>Confirm delete test</strong>'
+      const emphasized = Array.from(
+        message?.querySelectorAll('strong') || []
+      ).map((element) => element.textContent);
+      expect(emphasized).toEqual(['UI-100', 'Confirm delete test']);
+      expect(dialog?.getAttribute('aria-labelledby')).toBe(
+        'delete-confirm-title'
       );
+      expect(dialog?.getAttribute('aria-describedby')).toBe(
+        'delete-confirm-message'
+      );
+      expect(document.activeElement?.id).toBe('delete-cancel-btn');
+    });
+
+    test('renders malicious issue titles as inert text', async () => {
+      document.body.innerHTML =
+        '<section class="panel"><div id="mount"></div></section>';
+      const mount = /** @type {HTMLElement} */ (
+        document.getElementById('mount')
+      );
+      const malicious_title = '<img src=x onerror="alert(1)">';
+      const issue = {
+        id: 'UI-100-XSS',
+        title: malicious_title,
+        dependencies: [],
+        dependents: []
+      };
+      const stores = {
+        /** @param {string} id */
+        snapshotFor(id) {
+          return id === 'detail:UI-100-XSS' ? [issue] : [];
+        },
+        subscribe() {
+          return () => {};
+        }
+      };
+      const view = createDetailView(mount, async () => ({}), undefined, stores);
+      await view.load('UI-100-XSS');
+
+      /** @type {HTMLButtonElement} */ (
+        mount.querySelector('.delete-issue-btn')
+      ).click();
+
+      const dialog = /** @type {HTMLDialogElement} */ (
+        document.getElementById('delete-confirm-dialog')
+      );
+      expect(dialog.querySelector('.delete-confirm__message img')).toBeNull();
+      expect(dialog.textContent).toContain(malicious_title);
+    });
+
+    test('binds the native cancel handler once across repeated opens', async () => {
+      document.body.innerHTML =
+        '<section class="panel"><div id="mount"></div></section>';
+      const mount = /** @type {HTMLElement} */ (
+        document.getElementById('mount')
+      );
+      const issue = {
+        id: 'UI-100-CANCEL',
+        title: 'Repeated cancel',
+        dependencies: [],
+        dependents: []
+      };
+      const stores = {
+        /** @param {string} id */
+        snapshotFor(id) {
+          return id === 'detail:UI-100-CANCEL' ? [issue] : [];
+        },
+        subscribe() {
+          return () => {};
+        }
+      };
+      const view = createDetailView(mount, async () => ({}), undefined, stores);
+      await view.load('UI-100-CANCEL');
+      const delete_button = /** @type {HTMLButtonElement} */ (
+        mount.querySelector('.delete-issue-btn')
+      );
+      delete_button.click();
+      const dialog = /** @type {HTMLDialogElement} */ (
+        document.getElementById('delete-confirm-dialog')
+      );
+      const close = vi.fn(() => dialog.removeAttribute('open'));
+      dialog.close = close;
+
+      dialog.dispatchEvent(new Event('cancel', { cancelable: true }));
+      delete_button.click();
+      dialog.dispatchEvent(new Event('cancel', { cancelable: true }));
+
+      expect(close).toHaveBeenCalledTimes(2);
     });
 
     test('cancel button closes dialog without deleting', async () => {
@@ -660,6 +864,75 @@ describe('views/detail', () => {
       // View should be cleared (showing placeholder)
       const placeholder = mount.querySelector('.muted');
       expect(placeholder?.textContent).toContain('No issue selected');
+    });
+
+    test('deletes the issue shown when confirmation opened', async () => {
+      document.body.innerHTML =
+        '<section class="panel"><div id="mount"></div></section>';
+      const mount = /** @type {HTMLElement} */ (
+        document.getElementById('mount')
+      );
+      const issues = new Map([
+        [
+          'UI-OLD',
+          {
+            id: 'UI-OLD',
+            title: 'Original issue',
+            dependencies: [],
+            dependents: []
+          }
+        ],
+        [
+          'UI-NEW',
+          {
+            id: 'UI-NEW',
+            title: 'New issue',
+            dependencies: [],
+            dependents: []
+          }
+        ]
+      ]);
+      /** @type {{ type: string, payload: unknown }[]} */
+      const calls = [];
+      const stores = {
+        /** @param {string} id */
+        snapshotFor(id) {
+          const issue_id = id.replace('detail:', '');
+          const issue = issues.get(issue_id);
+          return issue ? [issue] : [];
+        },
+        subscribe() {
+          return () => {};
+        }
+      };
+      const view = createDetailView(
+        mount,
+        async (type, payload) => {
+          calls.push({ type, payload });
+          return { deleted: true };
+        },
+        undefined,
+        stores
+      );
+      await view.load('UI-OLD');
+      /** @type {HTMLButtonElement} */ (
+        mount.querySelector('.delete-issue-btn')
+      ).click();
+
+      await view.load('UI-NEW');
+      const dialog = /** @type {HTMLDialogElement} */ (
+        document.getElementById('delete-confirm-dialog')
+      );
+      /** @type {HTMLButtonElement} */ (
+        dialog.querySelector('#delete-confirm-btn')
+      ).click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(calls).toContainEqual({
+        type: 'delete-issue',
+        payload: { id: 'UI-OLD' }
+      });
+      expect(mount.textContent).toContain('New issue');
     });
   });
 });

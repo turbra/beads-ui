@@ -29,6 +29,8 @@
  * @typedef {{
  *   itemsById: Map<string, ItemMeta>,
  *   subscribers: Set<WebSocket>,
+ *   initialized: boolean,
+ *   truncated: boolean,
  *   lock: Promise<void>
  * }} Entry
  */
@@ -42,6 +44,8 @@ function createEntry() {
   return {
     itemsById: new Map(),
     subscribers: new Set(),
+    initialized: false,
+    truncated: false,
     lock: Promise.resolve()
   };
 }
@@ -269,6 +273,7 @@ export class SubscriptionRegistry {
     const prev = entry.itemsById;
     const delta = computeDelta(prev, next_map);
     entry.itemsById = new Map(next_map);
+    entry.initialized = true;
     return delta;
   }
 

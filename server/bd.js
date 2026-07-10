@@ -4,6 +4,7 @@ import { debug } from './logging.js';
 
 const log = debug('bd');
 const BD_INTERACTIVE_BURST_LIMIT = 4;
+const DEFAULT_BD_TIMEOUT_MS = 30000;
 
 /**
  * @typedef {'interactive' | 'background'} BdPriority
@@ -109,6 +110,7 @@ function runBdUnlocked(args, options = {}) {
 
   /** @type {string[]} */
   const final_args = buildBdArgs(args);
+  const timeout_ms = resolveBdTimeout(options.timeout_ms, env_with_db);
 
   return new Promise((resolve) => {
     const child = spawn(bin, final_args, spawn_opts);
@@ -131,12 +133,19 @@ function runBdUnlocked(args, options = {}) {
       });
     }
 
+    let settled = false;
+    let timed_out = false;
     /** @type {ReturnType<typeof setTimeout> | undefined} */
     let timer;
-    if (options.timeout_ms && options.timeout_ms > 0) {
+    if (timeout_ms > 0) {
       timer = setTimeout(() => {
-        child.kill('SIGKILL');
-      }, options.timeout_ms);
+        timed_out = true;
+        try {
+          child.kill('SIGKILL');
+        } catch (err) {
+          log('failed to kill timed out bd process: %o', err);
+        }
+      }, timeout_ms);
       timer.unref?.();
     }
 
@@ -144,13 +153,21 @@ function runBdUnlocked(args, options = {}) {
      * @param {number | string | null} code
      */
     const finish = (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       if (timer) {
         clearTimeout(timer);
       }
+      const stderr = err_chunks.join('');
+      const timeout_message = `bd timed out after ${timeout_ms}ms`;
       resolve({
-        code: Number(code || 0),
+        code: timed_out ? 124 : typeof code === 'number' ? code : 1,
         stdout: out_chunks.join(''),
-        stderr: err_chunks.join('')
+        stderr: timed_out
+          ? `${stderr}${stderr.endsWith('\n') || stderr.length === 0 ? '' : '\n'}${timeout_message}`
+          : stderr
       });
     };
 
@@ -163,6 +180,29 @@ function runBdUnlocked(args, options = {}) {
       finish(code);
     });
   });
+}
+
+/**
+ * Resolve the bd deadline. An explicit option wins over the child environment;
+ * zero disables the deadline. Invalid and negative values use the default.
+ *
+ * @param {number | undefined} explicit_timeout_ms
+ * @param {Record<string, string | undefined>} env
+ */
+function resolveBdTimeout(explicit_timeout_ms, env) {
+  if (explicit_timeout_ms !== undefined) {
+    return Number.isFinite(explicit_timeout_ms) && explicit_timeout_ms >= 0
+      ? explicit_timeout_ms
+      : DEFAULT_BD_TIMEOUT_MS;
+  }
+  const raw_timeout = env.BDUI_BD_TIMEOUT_MS;
+  if (raw_timeout === undefined || raw_timeout.trim().length === 0) {
+    return DEFAULT_BD_TIMEOUT_MS;
+  }
+  const env_timeout_ms = Number(raw_timeout);
+  return Number.isFinite(env_timeout_ms) && env_timeout_ms >= 0
+    ? env_timeout_ms
+    : DEFAULT_BD_TIMEOUT_MS;
 }
 
 /**

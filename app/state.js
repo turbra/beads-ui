@@ -3,12 +3,21 @@
  */
 import { debug } from './utils/logging.js';
 
+const STATUS_FILTER_ORDER = Object.freeze(['open', 'in_progress', 'closed']);
+const TYPE_FILTER_ORDER = Object.freeze([
+  'bug',
+  'feature',
+  'task',
+  'epic',
+  'chore'
+]);
+
 /**
- * @typedef {'all'|'open'|'in_progress'|'closed'|'ready'} StatusFilter
+ * @typedef {'open'|'in_progress'|'closed'|'ready'} StatusFilter
  */
 
 /**
- * @typedef {{ status: StatusFilter, search: string, type: string }} Filters
+ * @typedef {{ status: StatusFilter[], search: string, type: string[] }} Filters
  */
 
 /**
@@ -44,8 +53,8 @@ import { debug } from './utils/logging.js';
 /**
  * Create a simple store for application state.
  *
- * @param {Partial<AppState>} [initial]
- * @returns {{ getState: () => AppState, setState: (patch: { selected_id?: string | null, filters?: Partial<Filters>, workspace?: Partial<WorkspaceState> }) => void, subscribe: (fn: (s: AppState) => void) => () => void }}
+ * @param {{ selected_id?: string | null, view?: ViewName, filters?: Partial<Filters>, board?: Partial<BoardState>, workspace?: Partial<WorkspaceState> }} [initial]
+ * @returns {{ getState: () => AppState, setState: (patch: { selected_id?: string | null, view?: ViewName, filters?: Partial<Filters>, board?: Partial<BoardState>, workspace?: Partial<WorkspaceState> }) => void, subscribe: (fn: (s: AppState) => void) => () => void }}
  */
 export function createStore(initial = {}) {
   const log = debug('state');
@@ -54,10 +63,9 @@ export function createStore(initial = {}) {
     selected_id: initial.selected_id ?? null,
     view: initial.view ?? 'issues',
     filters: {
-      status: initial.filters?.status ?? 'all',
+      status: normalizeStatusFilters(initial.filters?.status),
       search: initial.filters?.search ?? '',
-      type:
-        typeof initial.filters?.type === 'string' ? initial.filters?.type : ''
+      type: normalizeTypeFilters(initial.filters?.type)
     },
     board: {
       closed_filter:
@@ -96,11 +104,19 @@ export function createStore(initial = {}) {
      * @param {{ selected_id?: string | null, filters?: Partial<Filters>, board?: Partial<BoardState>, workspace?: Partial<WorkspaceState> }} patch
      */
     setState(patch) {
+      const requested_filters = {
+        ...state.filters,
+        ...(patch.filters || {})
+      };
       /** @type {AppState} */
       const next = {
         ...state,
         ...patch,
-        filters: { ...state.filters, ...(patch.filters || {}) },
+        filters: {
+          status: normalizeStatusFilters(requested_filters.status),
+          search: String(requested_filters.search || ''),
+          type: normalizeTypeFilters(requested_filters.type)
+        },
         board: { ...state.board, ...(patch.board || {}) },
         workspace: {
           current:
@@ -120,9 +136,9 @@ export function createStore(initial = {}) {
       if (
         next.selected_id === state.selected_id &&
         next.view === state.view &&
-        next.filters.status === state.filters.status &&
+        arraysEqual(next.filters.status, state.filters.status) &&
         next.filters.search === state.filters.search &&
-        next.filters.type === state.filters.type &&
+        arraysEqual(next.filters.type, state.filters.type) &&
         next.board.closed_filter === state.board.closed_filter &&
         !workspace_changed
       ) {
@@ -143,4 +159,46 @@ export function createStore(initial = {}) {
       return () => subs.delete(fn);
     }
   };
+}
+
+/**
+ * Normalize persisted or view-provided status filters. Ready is a computed
+ * server-side view and is therefore mutually exclusive with stored statuses.
+ *
+ * @param {unknown} value
+ * @returns {StatusFilter[]}
+ */
+export function normalizeStatusFilters(value) {
+  const raw = Array.isArray(value) ? value : [value];
+  const normalized = raw.map((item) => String(item || '').trim());
+  if (normalized.includes('ready')) {
+    return ['ready'];
+  }
+  const selected = new Set(normalized);
+  return /** @type {StatusFilter[]} */ (
+    STATUS_FILTER_ORDER.filter((status) => selected.has(status))
+  );
+}
+
+/**
+ * Normalize persisted or view-provided issue type filters in UI order.
+ *
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+export function normalizeTypeFilters(value) {
+  const raw = Array.isArray(value) ? value : [value];
+  const selected = new Set(raw.map((item) => String(item || '').trim()));
+  return TYPE_FILTER_ORDER.filter((type) => selected.has(type));
+}
+
+/**
+ * @param {string[]} left
+ * @param {string[]} right
+ */
+function arraysEqual(left, right) {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
 }

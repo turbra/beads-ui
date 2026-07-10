@@ -91,5 +91,69 @@ describe('ws list refresh coalescing', () => {
     // After debounce window, one refresh per active spec
     await vi.advanceTimersByTimeAsync(1);
     expect(mock.mock.calls.length).toBe(2);
+    wss.close();
+  });
+
+  test('runs one immediate trailing pass for events during refresh', async () => {
+    const server = createServer();
+    const { wss } = attachWsServer(server, {
+      path: '/ws',
+      heartbeat_ms: 10000,
+      refresh_debounce_ms: 50
+    });
+    const socket = {
+      sent: /** @type {string[]} */ ([]),
+      readyState: 1,
+      OPEN: 1,
+      /** @param {string} msg */
+      send(msg) {
+        this.sent.push(String(msg));
+      }
+    };
+    wss.clients.add(/** @type {any} */ (socket));
+    await handleMessage(
+      /** @type {any} */ (socket),
+      Buffer.from(
+        JSON.stringify({
+          id: 'l1',
+          type: /** @type {any} */ ('subscribe-list'),
+          payload: { id: 'c1', type: 'all-issues' }
+        })
+      )
+    );
+    const mock = /** @type {import('vitest').Mock} */ (
+      fetchListForSubscription
+    );
+    mock.mockClear();
+    /** @type {(() => void) | undefined} */
+    let resolve_first;
+    mock
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolve_first = () =>
+              resolve({
+                ok: true,
+                items: [{ id: 'A', updated_at: 1, closed_at: null }]
+              });
+          })
+      )
+      .mockResolvedValue({
+        ok: true,
+        items: [{ id: 'A', updated_at: 2, closed_at: null }]
+      });
+
+    const refresh = scheduleListRefresh();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mock).toHaveBeenCalledTimes(1);
+
+    scheduleListRefresh();
+    scheduleListRefresh();
+    expect(mock).toHaveBeenCalledTimes(1);
+    resolve_first?.();
+    await refresh;
+
+    expect(mock).toHaveBeenCalledTimes(2);
+    wss.close();
   });
 });

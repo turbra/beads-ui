@@ -21,6 +21,8 @@ export function createSubscriptionIssueStores() {
   const listeners = new Set();
   /** @type {Map<string, () => void>} */
   const store_unsubs = new Map();
+  /** @type {Map<string, SubscriptionIssueStoreOptions>} */
+  const options_by_id = new Map();
 
   /**
    * @param {string} client_id
@@ -105,11 +107,13 @@ export function createSubscriptionIssueStores() {
       }
       const new_store = createSubscriptionIssueStore(client_id, options);
       stores_by_id.set(client_id, new_store);
+      options_by_id.set(client_id, { ...options });
       const off_new = new_store.subscribe(() => emit(client_id));
       store_unsubs.set(client_id, off_new);
     } else if (!has_store) {
       const store = createSubscriptionIssueStore(client_id, options);
       stores_by_id.set(client_id, store);
+      options_by_id.set(client_id, { ...options });
       // Fan out per-store events to global subscribers
       const off = store.subscribe(() => emit(client_id));
       store_unsubs.set(client_id, off);
@@ -124,6 +128,7 @@ export function createSubscriptionIssueStores() {
   function unregister(client_id) {
     log('unregister %s', client_id);
     key_by_id.delete(client_id);
+    options_by_id.delete(client_id);
     const store = stores_by_id.get(client_id);
     if (store) {
       store.dispose();
@@ -140,9 +145,43 @@ export function createSubscriptionIssueStores() {
     }
   }
 
+  /**
+   * Replace active stores after reconnect so a fresh server revision sequence
+   * is accepted while the last visible snapshot remains available.
+   *
+   * @returns {string[]}
+   */
+  function resetForReconnect() {
+    const client_ids = Array.from(stores_by_id.keys());
+    for (const client_id of client_ids) {
+      const previous = stores_by_id.get(client_id);
+      if (!previous) {
+        continue;
+      }
+      const items = previous.snapshot().slice();
+      const off = store_unsubs.get(client_id);
+      if (off) {
+        off();
+      }
+      previous.dispose();
+      const next = createSubscriptionIssueStore(
+        client_id,
+        options_by_id.get(client_id)
+      );
+      stores_by_id.set(client_id, next);
+      store_unsubs.set(
+        client_id,
+        next.subscribe(() => emit(client_id))
+      );
+      next.seed(items);
+    }
+    return client_ids;
+  }
+
   return {
     register,
     unregister,
+    resetForReconnect,
     /**
      * @param {string} client_id
      */

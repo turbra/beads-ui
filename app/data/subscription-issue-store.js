@@ -39,6 +39,8 @@ export function createSubscriptionIssueStore(id, options = {}) {
   let is_disposed = false;
   /** @type {boolean} */
   let emit_scheduled = false;
+  /** @type {boolean} */
+  let ordered_dirty = false;
   /** @type {(a:any,b:any)=>number} */
   const sort = options.sort || cmpPriorityThenCreated;
 
@@ -47,6 +49,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
     if (is_disposed) {
       return;
     }
+    ensureOrdered();
     for (const fn of Array.from(listeners)) {
       try {
         fn();
@@ -66,6 +69,13 @@ export function createSubscriptionIssueStore(id, options = {}) {
 
   function rebuildOrdered() {
     ordered = Array.from(items_by_id.values()).sort(sort);
+    ordered_dirty = false;
+  }
+
+  function ensureOrdered() {
+    if (ordered_dirty) {
+      rebuildOrdered();
+    }
   }
 
   /**
@@ -121,7 +131,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
           items_by_id.set(it.id, it);
         }
       }
-      rebuildOrdered();
+      ordered_dirty = true;
       last_revision = rev;
       scheduleEmit();
       return;
@@ -132,6 +142,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
         const existing = items_by_id.get(it.id);
         if (!existing) {
           items_by_id.set(it.id, it);
+          ordered_dirty = true;
         } else {
           // Guard with updated_at; prefer newer
           const prev_ts = Number.isFinite(existing.updated_at)
@@ -161,19 +172,18 @@ export function createSubscriptionIssueStore(id, options = {}) {
             if (preserve_comments) {
               existing.comments = previous_comments;
             }
+            ordered_dirty = true;
           } else {
             // stale by timestamp; ignore
           }
         }
-        rebuildOrdered();
       }
       last_revision = rev;
       scheduleEmit();
     } else if (msg.type === 'delete') {
       const rid = String(msg.issue_id || '');
       if (rid) {
-        items_by_id.delete(rid);
-        rebuildOrdered();
+        ordered_dirty = items_by_id.delete(rid) || ordered_dirty;
       }
       last_revision = rev;
       scheduleEmit();
@@ -212,7 +222,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
       changed = true;
     }
     if (changed) {
-      rebuildOrdered();
+      ordered_dirty = true;
       scheduleEmit();
     }
   }
@@ -232,6 +242,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
     seed,
     snapshot() {
       // Return as read-only view; callers must not mutate
+      ensureOrdered();
       return ordered;
     },
     size() {
@@ -248,6 +259,7 @@ export function createSubscriptionIssueStore(id, options = {}) {
       emit_scheduled = false;
       items_by_id.clear();
       ordered = [];
+      ordered_dirty = false;
       listeners.clear();
       last_revision = 0;
     }

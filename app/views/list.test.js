@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { createSubscriptionIssueStore } from '../data/subscription-issue-store.js';
 import { createListView } from './list.js';
 
@@ -45,6 +45,18 @@ function isFilterChecked(mount, dropdownIndex, optionText) {
     option?.querySelector('input[type="checkbox"]')
   );
   return checkbox?.checked ?? false;
+}
+
+/**
+ * Apply the debounced search filter.
+ *
+ * @param {HTMLInputElement} input
+ * @param {string} value
+ */
+async function searchFor(input, value) {
+  input.value = value;
+  input.dispatchEvent(new Event('input'));
+  await new Promise((resolve) => setTimeout(resolve, 130));
 }
 
 function createTestIssueStores() {
@@ -176,8 +188,7 @@ describe('views/list', () => {
     // Clear status filter and search
     toggleFilter(mount, 0, 'Open'); // toggle off to show all
     await Promise.resolve();
-    input.value = 'ga';
-    input.dispatchEvent(new Event('input'));
+    await searchFor(input, 'ga');
     const visible = Array.from(mount.querySelectorAll('tr.issue-row')).map(
       (el) => ({
         id: el.getAttribute('data-issue-id') || '',
@@ -265,9 +276,7 @@ describe('views/list', () => {
     const input = /** @type {HTMLInputElement} */ (
       mount.querySelector('input[type="search"]')
     );
-    input.value = 'ga';
-    input.dispatchEvent(new Event('input'));
-    await Promise.resolve();
+    await searchFor(input, 'ga');
     const filtered = Array.from(mount.querySelectorAll('tr.issue-row')).map(
       (el) => el.getAttribute('data-issue-id') || ''
     );
@@ -665,6 +674,308 @@ describe('views/list', () => {
       (el) => el.getAttribute('data-issue-id') || ''
     );
     expect(rows).toEqual(['UI-1', 'UI-2']);
+  });
+
+  test('keeps Ready mutually exclusive with concrete statuses', async () => {
+    document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const state = {
+      selected_id: null,
+      view: 'issues',
+      filters: { status: [], type: [], search: '' }
+    };
+    /** @type {Set<(next_state: any) => void>} */
+    const listeners = new Set();
+    const store = {
+      getState() {
+        return state;
+      },
+      /** @param {any} patch */
+      setState(patch) {
+        Object.assign(state, patch);
+        state.filters = { ...state.filters, ...(patch.filters || {}) };
+        for (const listener of listeners) {
+          listener(state);
+        }
+      },
+      /** @param {(next_state: any) => void} listener */
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      }
+    };
+    const issueStores = createTestIssueStores();
+    const view = createListView(
+      mount,
+      async () => [],
+      undefined,
+      store,
+      undefined,
+      issueStores
+    );
+    await view.load();
+
+    toggleFilter(mount, 0, 'Open');
+    await Promise.resolve();
+    toggleFilter(mount, 0, 'Ready');
+    await Promise.resolve();
+
+    expect(state.filters.status).toEqual(['ready']);
+    expect(isFilterChecked(mount, 0, 'Open')).toBe(false);
+    expect(isFilterChecked(mount, 0, 'Ready')).toBe(true);
+
+    toggleFilter(mount, 0, 'Closed');
+    await Promise.resolve();
+
+    expect(state.filters.status).toEqual(['closed']);
+    expect(isFilterChecked(mount, 0, 'Ready')).toBe(false);
+    expect(isFilterChecked(mount, 0, 'Closed')).toBe(true);
+  });
+
+  test('debounces search while matching assignees and labels', async () => {
+    vi.useFakeTimers();
+    try {
+      document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
+      const mount = /** @type {HTMLElement} */ (
+        document.getElementById('mount')
+      );
+      const issueStores = createTestIssueStores();
+      issueStores.getStore('tab:issues').applyPush({
+        type: 'snapshot',
+        id: 'tab:issues',
+        revision: 1,
+        issues: [
+          {
+            id: 'UI-SEARCH-1',
+            title: 'Alpha',
+            assignee: 'alice',
+            labels: ['frontend']
+          },
+          {
+            id: 'UI-SEARCH-2',
+            title: 'Beta',
+            assignee: 'bob',
+            labels: ['backend']
+          }
+        ]
+      });
+      const view = createListView(
+        mount,
+        async () => [],
+        undefined,
+        undefined,
+        undefined,
+        issueStores
+      );
+      await view.load();
+      const input = /** @type {HTMLInputElement} */ (
+        mount.querySelector('input[type="search"]')
+      );
+
+      input.value = 'frontend';
+      input.dispatchEvent(new Event('input'));
+
+      expect(input.value).toBe('frontend');
+      expect(mount.querySelectorAll('tr.issue-row')).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(120);
+      expect(
+        mount.querySelector('tr.issue-row')?.getAttribute('data-issue-id')
+      ).toBe('UI-SEARCH-1');
+
+      input.value = 'bob';
+      input.dispatchEvent(new Event('input'));
+      await vi.advanceTimersByTimeAsync(120);
+      expect(
+        mount.querySelector('tr.issue-row')?.getAttribute('data-issue-id')
+      ).toBe('UI-SEARCH-2');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('sorts Priority and Updated with stable issue ID ties', async () => {
+    document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const issueStores = createTestIssueStores();
+    issueStores.getStore('tab:issues').applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 1,
+      issues: [
+        { id: 'UI-C', title: 'C', priority: 1, updated_at: '2025-01-01' },
+        { id: 'UI-B', title: 'B', priority: 2, updated_at: '2025-03-01' },
+        { id: 'UI-A', title: 'A', priority: 1, updated_at: '2025-03-01' }
+      ]
+    });
+    const view = createListView(
+      mount,
+      async () => [],
+      undefined,
+      undefined,
+      undefined,
+      issueStores
+    );
+    await view.load();
+    const rowIds = () =>
+      Array.from(mount.querySelectorAll('tr.issue-row')).map((row) =>
+        row.getAttribute('data-issue-id')
+      );
+
+    // With no explicit view sort, preserve the upstream store's order.
+    expect(rowIds()).toEqual(['UI-A', 'UI-C', 'UI-B']);
+    /** @type {HTMLButtonElement} */ (
+      mount.querySelector('button.sort-header')
+    ).click();
+    expect(rowIds()).toEqual(['UI-A', 'UI-C', 'UI-B']);
+    expect(
+      mount.querySelector('th[aria-sort="ascending"]')?.textContent?.trim()
+    ).toBe('Priority');
+
+    /** @type {HTMLButtonElement} */ (
+      mount.querySelector('button.sort-header')
+    ).click();
+    expect(rowIds()).toEqual(['UI-B', 'UI-A', 'UI-C']);
+
+    const updated_button = Array.from(
+      mount.querySelectorAll('button.sort-header')
+    ).find((button) => button.textContent?.includes('Updated'));
+    /** @type {HTMLButtonElement} */ (updated_button).click();
+    expect(rowIds()).toEqual(['UI-A', 'UI-B', 'UI-C']);
+    expect(
+      mount.querySelector('th[aria-sort="descending"]')?.textContent?.trim()
+    ).toBe('Updated');
+  });
+
+  test('offers contextual empty-state actions', async () => {
+    document.body.innerHTML =
+      '<button id="new-issue-btn"></button><aside id="mount" class="panel"></aside>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const create_button = /** @type {HTMLButtonElement} */ (
+      document.getElementById('new-issue-btn')
+    );
+    const on_create = vi.fn();
+    create_button.addEventListener('click', on_create);
+    const issueStores = createTestIssueStores();
+    const view = createListView(
+      mount,
+      async () => [],
+      undefined,
+      undefined,
+      undefined,
+      issueStores
+    );
+    await view.load();
+
+    expect(mount.textContent).toContain('No issues');
+    /** @type {HTMLButtonElement} */ (
+      mount.querySelector('.list-empty-state button')
+    ).click();
+    expect(on_create).toHaveBeenCalledOnce();
+
+    issueStores.getStore('tab:issues').applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 1,
+      issues: [{ id: 'UI-EMPTY', title: 'Visible issue' }]
+    });
+    await view.load();
+    const input = /** @type {HTMLInputElement} */ (
+      mount.querySelector('input[type="search"]')
+    );
+    await searchFor(input, 'missing');
+    expect(mount.textContent).toContain('No matching issues');
+
+    /** @type {HTMLButtonElement} */ (
+      mount.querySelector('.list-empty-state button')
+    ).click();
+    await Promise.resolve();
+    expect(mount.querySelectorAll('tr.issue-row')).toHaveLength(1);
+  });
+
+  test('labels the eight-column grid and row controls', async () => {
+    document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const issueStores = createTestIssueStores();
+    issueStores.getStore('tab:issues').applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 1,
+      issues: [{ id: 'UI-A11Y', title: 'Accessible', updated_at: 1 }]
+    });
+    const view = createListView(
+      mount,
+      async () => [],
+      undefined,
+      undefined,
+      undefined,
+      issueStores
+    );
+    await view.load();
+
+    expect(mount.querySelector('table')?.getAttribute('aria-colcount')).toBe(
+      '8'
+    );
+    expect(mount.querySelectorAll('thead th')).toHaveLength(8);
+    expect(
+      mount.querySelector('tr.issue-row')?.getAttribute('aria-selected')
+    ).toBe('false');
+    expect(
+      mount.querySelector('select.badge--status')?.getAttribute('aria-label')
+    ).toBe('Status for UI-A11Y');
+    expect(
+      mount.querySelector('select.badge--priority')?.getAttribute('aria-label')
+    ).toBe('Priority for UI-A11Y');
+    expect(
+      mount.querySelector('input[type="search"]')?.getAttribute('aria-label')
+    ).toContain('assignee');
+    const filter_trigger = mount.querySelector('.filter-dropdown__trigger');
+    expect(filter_trigger?.getAttribute('aria-expanded')).toBe('false');
+    expect(filter_trigger?.getAttribute('aria-controls')).toBe(
+      'status-filter-menu'
+    );
+    expect(filter_trigger?.getAttribute('aria-haspopup')).toBe('true');
+  });
+
+  test('warns when the list reaches its explicit result boundary', async () => {
+    document.body.innerHTML = '<aside id="mount" class="panel"></aside>';
+    const mount = /** @type {HTMLElement} */ (document.getElementById('mount'));
+    const issueStores = createTestIssueStores();
+    issueStores.getStore('tab:issues').applyPush({
+      type: 'snapshot',
+      id: 'tab:issues',
+      revision: 1,
+      issues: Array.from({ length: 1000 }, (_, index) => ({
+        id: `UI-${index}`,
+        title: `Issue ${index}`
+      }))
+    });
+    const store = {
+      getState() {
+        return {
+          selected_id: null,
+          view: 'issues',
+          filters: { status: [], type: [], search: 'no-match' }
+        };
+      },
+      setState() {},
+      subscribe() {
+        return () => {};
+      }
+    };
+    const view = createListView(
+      mount,
+      async () => [],
+      undefined,
+      store,
+      undefined,
+      issueStores
+    );
+
+    await view.load();
+
+    expect(mount.querySelector('.list-boundary-notice')?.textContent).toContain(
+      'Showing up to 1000 issues'
+    );
   });
 
   test('filters by multiple types with dropdown checkboxes', async () => {

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { createSubscriptionIssueStore } from './subscription-issue-store.js';
 
 async function flushMicrotasks() {
@@ -339,6 +339,56 @@ describe('subscription issue store', () => {
     await flushMicrotasks();
 
     expect(count).toBe(2);
+  });
+
+  test('sorts once for a synchronous push burst', async () => {
+    const sort = vi.fn((a, b) => a.id.localeCompare(b.id));
+    const store = createSubscriptionIssueStore('s1', { sort });
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 1,
+      issues: [
+        { id: 'B', created_at: 10_000, updated_at: 10_000, closed_at: null },
+        { id: 'A', created_at: 10_000, updated_at: 10_000, closed_at: null }
+      ]
+    });
+    store.applyPush({
+      type: 'upsert',
+      id: 's1',
+      revision: 2,
+      issue: {
+        id: 'A',
+        title: 'A2',
+        created_at: 10_000,
+        updated_at: 10_060,
+        closed_at: null
+      }
+    });
+
+    await flushMicrotasks();
+
+    expect(sort).toHaveBeenCalledTimes(1);
+    expect(store.snapshot().map((issue) => issue.id)).toEqual(['A', 'B']);
+  });
+
+  test('sorts immediately for a synchronous snapshot read', async () => {
+    const sort = vi.fn((a, b) => a.id.localeCompare(b.id));
+    const store = createSubscriptionIssueStore('s1', { sort });
+    store.applyPush({
+      type: 'snapshot',
+      id: 's1',
+      revision: 1,
+      issues: [
+        { id: 'B', created_at: 10_000, updated_at: 10_000, closed_at: null },
+        { id: 'A', created_at: 10_000, updated_at: 10_000, closed_at: null }
+      ]
+    });
+
+    expect(store.snapshot().map((issue) => issue.id)).toEqual(['A', 'B']);
+    expect(sort).toHaveBeenCalledTimes(1);
+    await flushMicrotasks();
+    expect(sort).toHaveBeenCalledTimes(1);
   });
 
   test('dispose clears listeners and state', async () => {

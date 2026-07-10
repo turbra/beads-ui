@@ -7,7 +7,11 @@ import { createDataLayer } from './data/providers.js';
 import { createSubscriptionIssueStores } from './data/subscription-issue-stores.js';
 import { createSubscriptionStore } from './data/subscriptions-store.js';
 import { createHashRouter, parseHash, parseView } from './router.js';
-import { createStore } from './state.js';
+import {
+  createStore,
+  normalizeStatusFilters,
+  normalizeTypeFilters
+} from './state.js';
 import { createActivityIndicator } from './utils/activity-indicator.js';
 import { debug } from './utils/logging.js';
 import { showToast } from './utils/toast.js';
@@ -101,6 +105,25 @@ export function bootstrap(root_element) {
       fatal_dialog.open(title, message, detail);
     }
 
+    /**
+     * Return whether a subscription failure is an expected stale-request race.
+     *
+     * @param {unknown} err
+     */
+    function isExpectedSubscriptionError(err) {
+      if (!err || typeof err !== 'object') {
+        return false;
+      }
+      const code = /** @type {{ code?: unknown }} */ (err).code;
+      return (
+        code === 'subscription_superseded' ||
+        code === 'workspace_changed' ||
+        code === 'ws_disconnected' ||
+        code === 'ws_connection_failed' ||
+        code === 'ws_send_failed'
+      );
+    }
+
     const client = createWsClient();
     const tracked_send = activity.wrapSend((type, payload) =>
       client.send(type, payload)
@@ -148,6 +171,7 @@ export function bootstrap(root_element) {
     });
     // Derived list selectors: render from per-subscription snapshots
     const listSelectors = createListSelectors(sub_issue_stores);
+    let workspace_bootstrapped = false;
 
     // --- Workspace management ---
     /**
@@ -156,6 +180,7 @@ export function bootstrap(root_element) {
      */
     async function clearAndResubscribe() {
       log('clearing all subscriptions for workspace switch');
+      subscription_epoch += 1;
       // Unsubscribe from server-side subscriptions first
       if (unsub_issues_tab) {
         void unsub_issues_tab().catch(() => {});
@@ -200,6 +225,11 @@ export function bootstrap(root_element) {
       // Also clear any detail stores
       const s = store.getState();
       if (s.selected_id) {
+        if (unsub_detail) {
+          void unsub_detail().catch(() => {});
+          unsub_detail = null;
+        }
+        active_detail_id = null;
         try {
           sub_issue_stores.unregister(`detail:${s.selected_id}`);
         } catch {
@@ -210,14 +240,21 @@ export function bootstrap(root_element) {
       last_issues_spec_key = null;
       // Re-establish subscriptions for current view
       ensureTabSubscriptions(store.getState());
+      if (s.selected_id) {
+        openDetail(s.selected_id);
+      }
     }
 
     /**
      * Handle workspace change request from the picker.
      *
      * @param {string} workspace_path
+     * @param {boolean} [initial_restore]
      */
-    async function handleWorkspaceChange(workspace_path) {
+    async function handleWorkspaceChange(
+      workspace_path,
+      initial_restore = false
+    ) {
       log('requesting workspace switch to %s', workspace_path);
       try {
         const result = await client.send('set-workspace', {
@@ -237,8 +274,10 @@ export function bootstrap(root_element) {
           // Persist preference
           window.localStorage.setItem('beads-ui.workspace', workspace_path);
           // Clear and resubscribe if workspace actually changed
-          if (result.changed) {
+          if (result.changed && workspace_bootstrapped) {
             await clearAndResubscribe();
+          }
+          if (result.changed && !initial_restore) {
             showToast(
               'Switched to ' + getProjectName(workspace_path),
               'success',
@@ -267,8 +306,10 @@ export function bootstrap(root_element) {
 
     /**
      * Load available workspaces from server and update state.
+     *
+     * @param {boolean} [restore_saved]
      */
-    async function loadWorkspaces() {
+    async function loadWorkspaces(restore_saved = false) {
       try {
         const result = await client.send('list-workspaces', {});
         log('workspaces loaded: %o', result);
@@ -290,14 +331,18 @@ export function bootstrap(root_element) {
           // Check if we have a saved preference that differs from current
           const savedWorkspace =
             window.localStorage.getItem('beads-ui.workspace');
-          if (savedWorkspace && current && savedWorkspace !== current.path) {
+          if (
+            restore_saved &&
+            savedWorkspace &&
+            savedWorkspace !== current?.path
+          ) {
             // Check if saved workspace is in available list
             const savedExists = available.some(
               (/** @type {{ path: string }} */ ws) => ws.path === savedWorkspace
             );
             if (savedExists) {
               log('restoring saved workspace preference: %s', savedWorkspace);
-              await handleWorkspaceChange(savedWorkspace);
+              await handleWorkspaceChange(savedWorkspace, true);
             }
           }
         }
@@ -319,9 +364,10 @@ export function bootstrap(root_element) {
           }
         });
         // Reload workspaces to get fresh list
-        void loadWorkspaces();
-        // Clear and resubscribe
-        void clearAndResubscribe();
+        void loadWorkspaces(false);
+        if (workspace_bootstrapped) {
+          void clearAndResubscribe();
+        }
       }
     });
 
@@ -330,51 +376,94 @@ export function bootstrap(root_element) {
     // Show toasts for WebSocket connectivity changes
     /** @type {boolean} */
     let had_disconnect = false;
+    let connection_epoch = 0;
+    let reconnect_recovery_epoch = -1;
+
+    /**
+     * Replay live subscriptions with bounded retries while the same connection
+     * epoch remains active.
+     *
+     * @param {number} recovery_epoch
+     */
+    async function recoverSubscriptions(recovery_epoch) {
+      sub_issue_stores.resetForReconnect();
+      /** @type {unknown} */
+      let last_error = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await subscriptions.resubscribeAll();
+          if (recovery_epoch === connection_epoch) {
+            showToast('Reconnected', 'success', 2200);
+          }
+          return;
+        } catch (err) {
+          last_error = err;
+          if (recovery_epoch !== connection_epoch) {
+            return;
+          }
+          if (attempt < 2) {
+            const delay = 1000 * 2 ** attempt;
+            log(
+              'subscription replay attempt %d failed; retrying in %dms: %o',
+              attempt + 1,
+              delay,
+              err
+            );
+            showToast('Restoring live updates…', 'error', delay + 500);
+            await new Promise((resolve) => window.setTimeout(resolve, delay));
+          }
+        }
+      }
+      const message =
+        last_error instanceof Error && last_error.message
+          ? `Reconnected, but live updates failed: ${last_error.message}`
+          : 'Reconnected, but live updates could not be restored';
+      showToast(message, 'error', 5000);
+    }
+
     if (typeof client.onConnection === 'function') {
       /** @type {(s: 'connecting'|'open'|'closed'|'reconnecting') => void} */
       const onConn = (s) => {
         log('ws state %s', s);
         if (s === 'reconnecting' || s === 'closed') {
-          had_disconnect = true;
-          showToast('Connection lost. Reconnecting…', 'error', 4000);
+          if (!had_disconnect) {
+            had_disconnect = true;
+            connection_epoch += 1;
+            showToast('Connection lost. Reconnecting…', 'error', 4000);
+          }
         } else if (s === 'open' && had_disconnect) {
           had_disconnect = false;
-          showToast('Reconnected', 'success', 2200);
+          const recovery_epoch = connection_epoch;
+          reconnect_recovery_epoch = recovery_epoch;
+          const recovery = recoverSubscriptions(recovery_epoch).finally(() => {
+            if (reconnect_recovery_epoch === recovery_epoch) {
+              reconnect_recovery_epoch = -1;
+            }
+          });
+          void recovery;
         }
       };
       client.onConnection(onConn);
     }
     // Load persisted filters (status/search/type) from localStorage
-    /** @type {{ status: 'all'|'open'|'in_progress'|'closed'|'ready', search: string, type: string }} */
-    let persisted_filters = { status: 'all', search: '', type: '' };
+    /** @type {{ status: Array<'open'|'in_progress'|'closed'|'ready'>, search: string, type: string[] }} */
+    let persisted_filters = { status: [], search: '', type: [] };
     try {
       const raw = window.localStorage.getItem('beads-ui.filters');
       if (raw) {
         const obj = JSON.parse(raw);
         if (obj && typeof obj === 'object') {
-          const ALLOWED = ['bug', 'feature', 'task', 'epic', 'chore'];
-          let parsed_type = '';
-          if (typeof obj.type === 'string' && ALLOWED.includes(obj.type)) {
-            parsed_type = obj.type;
-          } else if (Array.isArray(obj.types)) {
-            // Backwards compatibility: pick first valid from previous array format
-            let first_valid = '';
-            for (const it of obj.types) {
-              if (ALLOWED.includes(String(it))) {
-                first_valid = /** @type {string} */ (it);
-                break;
-              }
-            }
-            parsed_type = first_valid;
-          }
           persisted_filters = {
-            status: ['all', 'open', 'in_progress', 'closed', 'ready'].includes(
-              obj.status
-            )
-              ? obj.status
-              : 'all',
+            status: normalizeStatusFilters(
+              obj.status !== undefined ? obj.status : obj.statuses
+            ),
             search: typeof obj.search === 'string' ? obj.search : '',
-            type: parsed_type
+            type: normalizeTypeFilters(
+              Array.isArray(obj.type) ||
+                (typeof obj.type === 'string' && obj.type.length > 0)
+                ? obj.type
+                : obj.types
+            )
           };
         }
       }
@@ -434,13 +523,8 @@ export function bootstrap(root_element) {
      * @param {string} type
      * @param {unknown} payload
      */
-    const transport = async (type, payload) => {
-      try {
-        return await tracked_send(/** @type {MessageType} */ (type), payload);
-      } catch {
-        return [];
-      }
-    };
+    const transport = (type, payload) =>
+      tracked_send(/** @type {MessageType} */ (type), payload);
     // Top navigation (optional mount)
     if (nav_mount) {
       createTopNav(nav_mount, store, router);
@@ -451,9 +535,6 @@ export function bootstrap(root_element) {
     if (workspace_mount) {
       createWorkspacePicker(workspace_mount, store, handleWorkspaceChange);
     }
-    // Load workspaces after WebSocket is connected
-    void loadWorkspaces();
-
     // Global New Issue dialog (UI-106) mounted at root so it is always visible
     const new_issue_dialog = createNewIssueDialog(
       root_element,
@@ -509,7 +590,7 @@ export function bootstrap(root_element) {
       const data = {
         status: s.filters.status,
         search: s.filters.search,
-        type: typeof s.filters.type === 'string' ? s.filters.type : ''
+        type: s.filters.type
       };
       const next_json = JSON.stringify(data);
       if (next_json !== persisted_filters_json) {
@@ -654,10 +735,14 @@ export function bootstrap(root_element) {
       if (detail) {
         void detail.load(detail_id);
       }
+      const request_epoch = subscription_epoch;
       void subscriptions
         .subscribeList(client_id, spec)
         .then((unsub) => {
-          if (active_detail_id !== detail_id) {
+          if (
+            request_epoch !== subscription_epoch ||
+            active_detail_id !== detail_id
+          ) {
             void unsub().catch(() => {});
             return;
           }
@@ -665,7 +750,9 @@ export function bootstrap(root_element) {
         })
         .catch((err) => {
           log('detail subscribe failed: %o', err);
-          showFatalFromError(err, 'issue details');
+          if (!isExpectedSubscriptionError(err)) {
+            showFatalFromError(err, 'issue details');
+          }
         });
     }
 
@@ -700,14 +787,11 @@ export function bootstrap(root_element) {
       }
     }
 
-    // If router already set a selected id (deep-link), open dialog now
-    const initial_id = store.getState().selected_id;
-    if (initial_id) {
-      openDetail(initial_id);
-    }
-
     // Open/close dialog based on selected_id (always dialog; no page variant)
     store.subscribe((s) => {
+      if (!workspace_bootstrapped) {
+        return;
+      }
       const id = s.selected_id;
       if (id) {
         openDetail(id);
@@ -758,6 +842,22 @@ export function bootstrap(root_element) {
     // Track in-flight subscriptions to prevent duplicates during rapid view switching
     /** @type {Set<string>} */
     const pending_subscriptions = new Set();
+    let subscription_epoch = 0;
+
+    /**
+     * Release a pending marker. A workspace change can invalidate a request
+     * while retaining the same active view/spec, so reconcile again after the
+     * stale request has stopped blocking its replacement.
+     *
+     * @param {string} pending_key
+     * @param {number} request_epoch
+     */
+    function finishPendingSubscription(pending_key, request_epoch) {
+      pending_subscriptions.delete(pending_key);
+      if (request_epoch !== subscription_epoch && workspace_bootstrapped) {
+        queueMicrotask(() => ensureTabSubscriptions(store.getState()));
+      }
+    }
 
     // Expose activity debug info globally for diagnostics
     // @ts-ignore
@@ -770,21 +870,20 @@ export function bootstrap(root_element) {
     /**
      * Compute subscription spec for Issues tab based on filters.
      *
-     * @param {{ status?: string }} filters
+     * @param {{ status?: string | string[] }} filters
      * @returns {{ type: string, params?: Record<string, string|number|boolean> }}
      */
     function computeIssuesSpec(filters) {
-      const st = String(filters?.status || 'all');
-      if (st === 'ready') {
+      const statuses = normalizeStatusFilters(filters?.status);
+      if (statuses.includes('ready')) {
         return { type: 'ready-issues' };
       }
-      if (st === 'in_progress') {
-        return { type: 'in-progress-issues' };
+      if (statuses.length > 0) {
+        return {
+          type: 'status-issues',
+          params: { statuses: statuses.join(',') }
+        };
       }
-      if (st === 'closed') {
-        return { type: 'closed-issues' };
-      }
-      // "all" and "open" map to all-issues; client filters apply locally
       return { type: 'all-issues' };
     }
 
@@ -828,6 +927,42 @@ export function bootstrap(root_element) {
     let last_issues_spec_key = null;
     /** @type {string|null} */
     let last_board_closed_spec_key = null;
+    /** @type {number | null} */
+    let board_midnight_timer = null;
+
+    /**
+     * Keep the board's local-day cutoff current for tabs left open overnight.
+     *
+     * @param {'issues'|'epics'|'board'} view
+     */
+    function scheduleBoardMidnightRefresh(view) {
+      if (board_midnight_timer !== null) {
+        window.clearTimeout(board_midnight_timer);
+        board_midnight_timer = null;
+      }
+      if (view !== 'board') {
+        return;
+      }
+      const now = new Date();
+      const next_midnight = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate() + 1,
+        0,
+        0,
+        0,
+        50
+      );
+      const delay = Math.max(1000, next_midnight.getTime() - now.getTime());
+      board_midnight_timer = window.setTimeout(() => {
+        board_midnight_timer = null;
+        const current = store.getState();
+        if (current.view === 'board') {
+          ensureTabSubscriptions(current);
+          scheduleBoardMidnightRefresh('board');
+        }
+      }, delay);
+    }
     /**
      * Ensure only the active tab has subscriptions; clean up previous.
      *
@@ -851,18 +986,33 @@ export function bootstrap(root_element) {
           !pending_subscriptions.has(issues_sub_key)
         ) {
           pending_subscriptions.add(issues_sub_key);
+          const request_epoch = subscription_epoch;
           void subscriptions
             .subscribeList('tab:issues', spec)
             .then((unsub) => {
+              const current = store.getState();
+              const current_key = JSON.stringify(
+                computeIssuesSpec(current.filters || {})
+              );
+              if (
+                request_epoch !== subscription_epoch ||
+                current.view !== 'issues' ||
+                current_key !== key
+              ) {
+                void unsub().catch(() => {});
+                return;
+              }
               unsub_issues_tab = unsub;
               last_issues_spec_key = key;
             })
             .catch((err) => {
               log('subscribe issues failed: %o', err);
-              showFatalFromError(err, 'issues list');
+              if (!isExpectedSubscriptionError(err)) {
+                showFatalFromError(err, 'issues list');
+              }
             })
             .finally(() => {
-              pending_subscriptions.delete(issues_sub_key);
+              finishPendingSubscription(issues_sub_key, request_epoch);
             });
         }
       } else if (unsub_issues_tab) {
@@ -887,17 +1037,27 @@ export function bootstrap(root_element) {
         // Only subscribe if not already subscribed and not in-flight
         if (!unsub_epics_tab && !pending_subscriptions.has('tab:epics')) {
           pending_subscriptions.add('tab:epics');
+          const request_epoch = subscription_epoch;
           void subscriptions
             .subscribeList('tab:epics', { type: 'epics' })
             .then((unsub) => {
+              if (
+                request_epoch !== subscription_epoch ||
+                store.getState().view !== 'epics'
+              ) {
+                void unsub().catch(() => {});
+                return;
+              }
               unsub_epics_tab = unsub;
             })
             .catch((err) => {
               log('subscribe epics failed: %o', err);
-              showFatalFromError(err, 'epics');
+              if (!isExpectedSubscriptionError(err)) {
+                showFatalFromError(err, 'epics');
+              }
             })
             .finally(() => {
-              pending_subscriptions.delete('tab:epics');
+              finishPendingSubscription('tab:epics', request_epoch);
             });
         }
       } else if (unsub_epics_tab) {
@@ -925,15 +1085,27 @@ export function bootstrap(root_element) {
             log('register board:ready store failed: %o', err);
           }
           pending_subscriptions.add('tab:board:ready');
+          const request_epoch = subscription_epoch;
           void subscriptions
             .subscribeList('tab:board:ready', { type: 'ready-issues' })
-            .then((u) => (unsub_board_ready = u))
+            .then((unsub) => {
+              if (
+                request_epoch !== subscription_epoch ||
+                store.getState().view !== 'board'
+              ) {
+                void unsub().catch(() => {});
+                return;
+              }
+              unsub_board_ready = unsub;
+            })
             .catch((err) => {
               log('subscribe board ready failed: %o', err);
-              showFatalFromError(err, 'board (Ready)');
+              if (!isExpectedSubscriptionError(err)) {
+                showFatalFromError(err, 'board (Ready)');
+              }
             })
             .finally(() => {
-              pending_subscriptions.delete('tab:board:ready');
+              finishPendingSubscription('tab:board:ready', request_epoch);
             });
         }
         // In Progress column
@@ -949,17 +1121,29 @@ export function bootstrap(root_element) {
             log('register board:in-progress store failed: %o', err);
           }
           pending_subscriptions.add('tab:board:in-progress');
+          const request_epoch = subscription_epoch;
           void subscriptions
             .subscribeList('tab:board:in-progress', {
               type: 'in-progress-issues'
             })
-            .then((u) => (unsub_board_in_progress = u))
+            .then((unsub) => {
+              if (
+                request_epoch !== subscription_epoch ||
+                store.getState().view !== 'board'
+              ) {
+                void unsub().catch(() => {});
+                return;
+              }
+              unsub_board_in_progress = unsub;
+            })
             .catch((err) => {
               log('subscribe board in-progress failed: %o', err);
-              showFatalFromError(err, 'board (In Progress)');
+              if (!isExpectedSubscriptionError(err)) {
+                showFatalFromError(err, 'board (In Progress)');
+              }
             })
             .finally(() => {
-              pending_subscriptions.delete('tab:board:in-progress');
+              finishPendingSubscription('tab:board:in-progress', request_epoch);
             });
         }
         // Closed column
@@ -983,6 +1167,7 @@ export function bootstrap(root_element) {
             unsub_board_closed = null;
           }
           pending_subscriptions.add(closed_sub_key);
+          const request_epoch = subscription_epoch;
           const ready_to_subscribe = previous_unsub
             ? previous_unsub().catch(() => {})
             : Promise.resolve();
@@ -990,16 +1175,30 @@ export function bootstrap(root_element) {
             .then(() =>
               subscriptions.subscribeList('tab:board:closed', closed_spec)
             )
-            .then((u) => {
-              unsub_board_closed = u;
+            .then((unsub) => {
+              const current = store.getState();
+              const current_key = JSON.stringify(
+                computeBoardClosedSpec(current.board || {})
+              );
+              if (
+                request_epoch !== subscription_epoch ||
+                current.view !== 'board' ||
+                current_key !== closed_key
+              ) {
+                void unsub().catch(() => {});
+                return;
+              }
+              unsub_board_closed = unsub;
               last_board_closed_spec_key = closed_key;
             })
             .catch((err) => {
               log('subscribe board closed failed: %o', err);
-              showFatalFromError(err, 'board (Closed)');
+              if (!isExpectedSubscriptionError(err)) {
+                showFatalFromError(err, 'board (Closed)');
+              }
             })
             .finally(() => {
-              pending_subscriptions.delete(closed_sub_key);
+              finishPendingSubscription(closed_sub_key, request_epoch);
             });
         }
         // Blocked column
@@ -1015,15 +1214,27 @@ export function bootstrap(root_element) {
             log('register board:blocked store failed: %o', err);
           }
           pending_subscriptions.add('tab:board:blocked');
+          const request_epoch = subscription_epoch;
           void subscriptions
             .subscribeList('tab:board:blocked', { type: 'blocked-issues' })
-            .then((u) => (unsub_board_blocked = u))
+            .then((unsub) => {
+              if (
+                request_epoch !== subscription_epoch ||
+                store.getState().view !== 'board'
+              ) {
+                void unsub().catch(() => {});
+                return;
+              }
+              unsub_board_blocked = unsub;
+            })
             .catch((err) => {
               log('subscribe board blocked failed: %o', err);
-              showFatalFromError(err, 'board (Blocked)');
+              if (!isExpectedSubscriptionError(err)) {
+                showFatalFromError(err, 'board (Blocked)');
+              }
             })
             .finally(() => {
-              pending_subscriptions.delete('tab:board:blocked');
+              finishPendingSubscription('tab:board:blocked', request_epoch);
             });
         }
       } else {
@@ -1081,14 +1292,17 @@ export function bootstrap(root_element) {
         board_root.hidden = s.view !== 'board';
         // detail_mount visibility handled in subscription above
       }
-      // Ensure subscriptions for the active tab before loading the view to
-      // avoid empty initial renders due to racing list-delta.
-      ensureTabSubscriptions(s);
-      if (!s.selected_id && s.view === 'epics') {
-        void epics_view.load();
-      }
-      if (!s.selected_id && s.view === 'board') {
-        void board_view.load();
+      if (workspace_bootstrapped) {
+        // Ensure subscriptions for the active tab before loading the view to
+        // avoid empty initial renders due to racing list-delta.
+        ensureTabSubscriptions(s);
+        if (!s.selected_id && s.view === 'epics') {
+          void epics_view.load();
+        }
+        if (!s.selected_id && s.view === 'board') {
+          void board_view.load();
+        }
+        scheduleBoardMidnightRefresh(s.view);
       }
       if (s.view !== persisted_view_value) {
         window.localStorage.setItem('beads-ui.view', s.view);
@@ -1096,8 +1310,37 @@ export function bootstrap(root_element) {
       }
     };
     store.subscribe(onRouteChange);
-    // Ensure initial state is reflected (fixes reload on #/epics)
+    // Reflect the route synchronously while workspace discovery gates only
+    // backend subscriptions and data loads.
     onRouteChange(store.getState());
+
+    document.addEventListener('visibilitychange', () => {
+      const current = store.getState();
+      if (
+        workspace_bootstrapped &&
+        document.visibilityState === 'visible' &&
+        current.view === 'board'
+      ) {
+        ensureTabSubscriptions(current);
+        scheduleBoardMidnightRefresh('board');
+      }
+    });
+
+    /**
+     * Discover and restore the selected workspace before any list/detail
+     * subscriptions are created.
+     */
+    async function initializeWorkspaceAndSubscriptions() {
+      await loadWorkspaces(true);
+      workspace_bootstrapped = true;
+      const initial_state = store.getState();
+      onRouteChange(initial_state);
+      if (initial_state.selected_id) {
+        openDetail(initial_state.selected_id);
+      }
+    }
+
+    void initializeWorkspaceAndSubscriptions();
 
     // Removed redundant filter-change subscription: handled by ensureTabSubscriptions
 

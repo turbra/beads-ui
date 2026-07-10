@@ -86,14 +86,16 @@ describe('views/epics', () => {
               title: 'Alpha',
               status: 'open',
               priority: 1,
-              issue_type: 'task'
+              issue_type: 'task',
+              updated_at: '2025-01-02T00:00:00Z'
             },
             {
               id: 'UI-3',
               title: 'Beta',
               status: 'closed',
               priority: 2,
-              issue_type: 'task'
+              issue_type: 'task',
+              updated_at: '2025-01-01T00:00:00Z'
             }
           ]
         }
@@ -105,6 +107,14 @@ describe('views/epics', () => {
     // After expansion, only non-closed child should be present
     const rows = mount.querySelectorAll('tr.epic-row');
     expect(rows.length).toBe(2);
+    expect(mount.querySelector('table')?.getAttribute('aria-colcount')).toBe(
+      '8'
+    );
+    expect(mount.querySelectorAll('thead th')).toHaveLength(8);
+    expect(rows[0].querySelector('.updated-col')?.textContent).not.toBe('');
+    expect(
+      rows[0].querySelector('select.badge--status')?.getAttribute('aria-label')
+    ).toBe('Status for UI-2');
     rows[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
     expect(navCalls[0]).toBe('UI-2');
   });
@@ -222,6 +232,18 @@ describe('views/epics', () => {
       )?.textContent?.trim()
     );
     expect(ids).toEqual(['UI-12', 'UI-11', 'UI-13']);
+
+    const updated_button = Array.from(
+      mount.querySelectorAll('button.sort-header')
+    ).find((button) => button.textContent?.includes('Updated'));
+    /** @type {HTMLButtonElement} */ (updated_button).click();
+    const updated_ids = Array.from(mount.querySelectorAll('tr.epic-row')).map(
+      (row) => row.getAttribute('data-issue-id')
+    );
+    expect(updated_ids).toEqual(['UI-13', 'UI-11', 'UI-12']);
+    expect(
+      mount.querySelector('th[aria-sort="descending"]')?.textContent?.trim()
+    ).toBe('Updated');
   });
 
   test('clicking inputs/selects inside a row does not navigate', async () => {

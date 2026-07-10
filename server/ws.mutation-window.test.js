@@ -29,7 +29,9 @@ function makeSocket() {
     /** @param {string} msg */
     send(msg) {
       this.sent.push(String(msg));
-    }
+    },
+    ping() {},
+    terminate() {}
   };
 }
 
@@ -97,11 +99,11 @@ describe('mutation window gating', () => {
     );
 
     // Simulate watcher event arriving before timeout
-    scheduleListRefresh();
+    const refresh = scheduleListRefresh();
 
     // Allow pending promises and microtasks to flush
     await vi.advanceTimersByTimeAsync(0);
-    await Promise.resolve();
+    await refresh;
 
     // Exactly one refresh pass over active specs
     expect(mFetch.mock.calls.length).toBe(2);
@@ -142,6 +144,8 @@ describe('mutation window gating', () => {
 
     // After timeout, one refresh per active spec
     await vi.advanceTimersByTimeAsync(1);
+    await Promise.resolve();
+    await vi.runOnlyPendingTimersAsync();
     expect(mFetch.mock.calls.length).toBe(2);
   });
 });

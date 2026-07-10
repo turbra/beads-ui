@@ -3,6 +3,9 @@ import { debug } from './logging.js';
 
 const log = debug('list-adapters');
 
+export const SUBSCRIPTION_LIST_LIMIT = 1000;
+const SUBSCRIPTION_LIST_FETCH_LIMIT = SUBSCRIPTION_LIST_LIMIT + 1;
+
 /**
  * Build concrete `bd` CLI args for a subscription type + params.
  * Always includes `--json` for parseable output.
@@ -14,7 +17,13 @@ export function mapSubscriptionToBdArgs(spec) {
   const t = String(spec.type);
   switch (t) {
     case 'all-issues': {
-      return ['list', '--json', '--tree=false'];
+      return [
+        'list',
+        '--json',
+        '--tree=false',
+        '--limit',
+        String(SUBSCRIPTION_LIST_FETCH_LIMIT)
+      ];
     }
     case 'epics': {
       return ['epic', 'status', '--json'];
@@ -23,10 +32,38 @@ export function mapSubscriptionToBdArgs(spec) {
       return ['blocked', '--json'];
     }
     case 'ready-issues': {
-      return ['ready', '--limit', '1000', '--json'];
+      return [
+        'ready',
+        '--limit',
+        String(SUBSCRIPTION_LIST_FETCH_LIMIT),
+        '--json'
+      ];
     }
     case 'in-progress-issues': {
-      return ['list', '--json', '--tree=false', '--status', 'in_progress'];
+      return [
+        'list',
+        '--json',
+        '--tree=false',
+        '--status',
+        'in_progress',
+        '--limit',
+        String(SUBSCRIPTION_LIST_FETCH_LIMIT)
+      ];
+    }
+    case 'status-issues': {
+      const statuses = String(spec.params?.statuses || '').trim();
+      if (statuses.length === 0) {
+        throw badRequest('Missing param: params.statuses');
+      }
+      return [
+        'list',
+        '--json',
+        '--tree=false',
+        '--status',
+        statuses,
+        '--limit',
+        String(SUBSCRIPTION_LIST_FETCH_LIMIT)
+      ];
     }
     case 'closed-issues': {
       const args = [
@@ -36,7 +73,7 @@ export function mapSubscriptionToBdArgs(spec) {
         '--status',
         'closed',
         '--limit',
-        '1000'
+        String(SUBSCRIPTION_LIST_FETCH_LIMIT)
       ];
       const since =
         typeof spec.params?.since === 'number' ? spec.params.since : 0;
@@ -103,6 +140,7 @@ export function normalizeIssueList(value) {
  * @typedef {Object} FetchListResultSuccess
  * @property {true} ok
  * @property {Array<{ id: string, updated_at: number, closed_at: number | null } & Record<string, unknown>>} items
+ * @property {boolean} truncated
  */
 
 /**
@@ -206,8 +244,12 @@ export async function fetchListForSubscription(spec, options = {}) {
       });
     }
 
-    const items = normalizeIssueList(raw);
-    return { ok: true, items };
+    const normalized_items = normalizeIssueList(raw);
+    const is_detail = String(spec.type) === 'issue-detail';
+    const limit = is_detail ? 1 : SUBSCRIPTION_LIST_LIMIT;
+    const truncated = !is_detail && normalized_items.length > limit;
+    const items = normalized_items.slice(0, limit);
+    return { ok: true, items, truncated };
   } catch (err) {
     log('bd invocation failed for %o (args=%o): %o', spec, args, err);
     return {

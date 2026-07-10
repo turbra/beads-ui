@@ -41,7 +41,7 @@ if (workspace_database.source !== 'home-default' && workspace_database.exists) {
 const db_watcher = watchDb(config.root_dir, () => {
   // Schedule subscription list refresh run for active subscriptions
   log('db change detected → schedule refresh');
-  scheduleListRefresh();
+  return scheduleListRefresh();
   // v2: all updates flow via subscription push envelopes only
 });
 

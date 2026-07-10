@@ -14,7 +14,7 @@ describe('list adapters for subscription types', () => {
 
   test('mapSubscriptionToBdArgs returns args for all-issues', () => {
     const args = mapSubscriptionToBdArgs({ type: 'all-issues' });
-    expect(args).toEqual(['list', '--json', '--tree=false']);
+    expect(args).toEqual(['list', '--json', '--tree=false', '--limit', '1001']);
   });
 
   test('mapSubscriptionToBdArgs returns args for epics', () => {
@@ -30,7 +30,7 @@ describe('list adapters for subscription types', () => {
 
   test('mapSubscriptionToBdArgs returns args for ready-issues', () => {
     const args = mapSubscriptionToBdArgs({ type: 'ready-issues' });
-    expect(args).toEqual(['ready', '--limit', '1000', '--json']);
+    expect(args).toEqual(['ready', '--limit', '1001', '--json']);
   });
 
   test('mapSubscriptionToBdArgs returns args for in-progress-issues', () => {
@@ -40,7 +40,26 @@ describe('list adapters for subscription types', () => {
       '--json',
       '--tree=false',
       '--status',
-      'in_progress'
+      'in_progress',
+      '--limit',
+      '1001'
+    ]);
+  });
+
+  test('mapSubscriptionToBdArgs returns args for mixed statuses', () => {
+    const args = mapSubscriptionToBdArgs({
+      type: 'status-issues',
+      params: { statuses: 'open,in_progress,closed' }
+    });
+
+    expect(args).toEqual([
+      'list',
+      '--json',
+      '--tree=false',
+      '--status',
+      'open,in_progress,closed',
+      '--limit',
+      '1001'
     ]);
   });
 
@@ -53,7 +72,7 @@ describe('list adapters for subscription types', () => {
       '--status',
       'closed',
       '--limit',
-      '1000'
+      '1001'
     ]);
   });
 
@@ -72,7 +91,7 @@ describe('list adapters for subscription types', () => {
       '--status',
       'closed',
       '--limit',
-      '1000',
+      '1001',
       '--closed-after',
       '2026-06-30T04:00:00.000Z'
     ]);
@@ -108,6 +127,7 @@ describe('list adapters for subscription types', () => {
     expect(res.ok).toBe(true);
     if (res.ok) {
       expect(res.items.length).toBe(3);
+      expect(res.truncated).toBe(false);
       expect(res.items[0]).toMatchObject({
         id: 'A-1',
         updated_at: Date.parse('2024-01-01T00:00:00.000Z'),
@@ -124,6 +144,77 @@ describe('list adapters for subscription types', () => {
         updated_at: 0,
         closed_at: null
       });
+    }
+  });
+
+  test('reports an exact untruncated result at the list ceiling', async () => {
+    /** @type {import('vitest').Mock} */ (runBdJson).mockResolvedValue({
+      code: 0,
+      stdoutJson: Array.from({ length: 1000 }, (_, index) => ({
+        id: `I-${index}`,
+        updated_at: index
+      }))
+    });
+
+    const res = await fetchListForSubscription({ type: 'all-issues' });
+
+    expect(res).toMatchObject({ ok: true, truncated: false });
+    if (res.ok) {
+      expect(res.items).toHaveLength(1000);
+    }
+  });
+
+  test('slices and reports capped list results above the ceiling', async () => {
+    /** @type {import('vitest').Mock} */ (runBdJson).mockResolvedValue({
+      code: 0,
+      stdoutJson: Array.from({ length: 1001 }, (_, index) => ({
+        id: `I-${index}`,
+        updated_at: index
+      }))
+    });
+
+    const res = await fetchListForSubscription({ type: 'all-issues' });
+
+    expect(res).toMatchObject({ ok: true, truncated: true });
+    if (res.ok) {
+      expect(res.items).toHaveLength(1000);
+    }
+  });
+
+  test('slices unlimitable blocked results on the server', async () => {
+    /** @type {import('vitest').Mock} */ (runBdJson).mockResolvedValue({
+      code: 0,
+      stdoutJson: Array.from({ length: 1001 }, (_, index) => ({
+        id: `B-${index}`,
+        updated_at: index
+      }))
+    });
+
+    const res = await fetchListForSubscription({ type: 'blocked-issues' });
+
+    expect(res).toMatchObject({ ok: true, truncated: true });
+    if (res.ok) {
+      expect(res.items).toHaveLength(1000);
+    }
+  });
+
+  test('slices unlimitable epic results after flattening', async () => {
+    /** @type {import('vitest').Mock} */ (runBdJson).mockResolvedValue({
+      code: 0,
+      stdoutJson: Array.from({ length: 1001 }, (_, index) => ({
+        epic: {
+          id: `E-${index}`,
+          status: 'open',
+          updated_at: index
+        }
+      }))
+    });
+
+    const res = await fetchListForSubscription({ type: 'epics' });
+
+    expect(res).toMatchObject({ ok: true, truncated: true });
+    if (res.ok) {
+      expect(res.items).toHaveLength(1000);
     }
   });
 

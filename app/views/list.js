@@ -1,7 +1,6 @@
 import { html, render } from 'lit-html';
 import { repeat } from 'lit-html/directives/repeat.js';
 import { createListSelectors } from '../data/list-selectors.js';
-import { cmpClosedDesc } from '../data/sort.js';
 import { ISSUE_TYPES, typeLabel } from '../utils/issue-type.js';
 import { issueHashFor } from '../utils/issue-url.js';
 import { debug } from '../utils/logging.js';
@@ -11,7 +10,7 @@ import { createIssueRowRenderer } from './issue-row.js';
 // List view implementation; requires a transport send function.
 
 /**
- * @typedef {{ id: string, title?: string, status?: 'closed'|'open'|'in_progress', priority?: number, issue_type?: string, assignee?: string, labels?: string[] }} Issue
+ * @typedef {{ id: string, title?: string, status?: 'closed'|'open'|'in_progress', priority?: number, issue_type?: string, assignee?: string, labels?: string[], updated_at?: string | number }} Issue
  */
 
 /**
@@ -51,6 +50,8 @@ export function createListView(
   let status_filters = [];
   /** @type {string} */
   let search_text = '';
+  /** @type {string} */
+  let search_draft = '';
   /** @type {Issue[]} */
   let issues_cache = [];
   /** @type {string[]} */
@@ -61,6 +62,12 @@ export function createListView(
   let unsubscribe = null;
   let status_dropdown_open = false;
   let type_dropdown_open = false;
+  /** @type {'priority'|'updated'|null} */
+  let sort_key = null;
+  /** @type {'asc'|'desc'} */
+  let sort_direction = 'asc';
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let search_timer = null;
 
   /**
    * Normalize legacy string filter to array format.
@@ -108,8 +115,13 @@ export function createListView(
   const toggleStatusFilter = async (status) => {
     if (status_filters.includes(status)) {
       status_filters = status_filters.filter((s) => s !== status);
+    } else if (status === 'ready') {
+      status_filters = ['ready'];
     } else {
-      status_filters = [...status_filters, status];
+      status_filters = [
+        ...status_filters.filter((selected) => selected !== 'ready'),
+        status
+      ];
     }
     log('status toggle %s -> %o', status, status_filters);
     if (store) {
@@ -126,12 +138,19 @@ export function createListView(
    */
   const onSearchInput = (ev) => {
     const input = /** @type {HTMLInputElement} */ (ev.currentTarget);
-    search_text = input.value;
-    log('search input %s', search_text);
-    if (store) {
-      store.setState({ filters: { search: search_text } });
+    search_draft = input.value;
+    log('search input %s', search_draft);
+    if (search_timer) {
+      clearTimeout(search_timer);
     }
-    doRender();
+    search_timer = setTimeout(() => {
+      search_timer = null;
+      search_text = search_draft;
+      if (store) {
+        store.setState({ filters: { search: search_text } });
+      }
+      doRender();
+    }, 120);
   };
 
   /**
@@ -196,12 +215,82 @@ export function createListView(
     if (s && s.filters && typeof s.filters === 'object') {
       status_filters = normalizeStatusFilter(s.filters.status);
       search_text = s.filters.search || '';
+      search_draft = search_text;
       type_filters = normalizeTypeFilter(s.filters.type);
     }
   }
   // Initial values are reflected via bound `.value` in the template
   // Compose helpers: centralize membership + entity selection + sorting
   const selectors = issue_stores ? createListSelectors(issue_stores) : null;
+
+  /**
+   * @param {'priority'|'updated'} key
+   */
+  function toggleSort(key) {
+    if (sort_key === key) {
+      sort_direction = sort_direction === 'asc' ? 'desc' : 'asc';
+    } else {
+      sort_key = key;
+      sort_direction = key === 'priority' ? 'asc' : 'desc';
+    }
+    doRender();
+  }
+
+  /**
+   * @param {Issue} issue
+   */
+  function updatedValue(issue) {
+    if (issue.updated_at === undefined || issue.updated_at === null) {
+      return 0;
+    }
+    if (typeof issue.updated_at === 'number') {
+      return issue.updated_at;
+    }
+    const parsed = Date.parse(issue.updated_at);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+
+  /**
+   * @param {Issue[]} issues
+   */
+  function sortIssues(issues) {
+    if (!sort_key) {
+      return issues;
+    }
+    const direction = sort_direction === 'asc' ? 1 : -1;
+    return issues.slice().sort((a, b) => {
+      const a_value =
+        sort_key === 'priority' ? (a.priority ?? 2) : updatedValue(a);
+      const b_value =
+        sort_key === 'priority' ? (b.priority ?? 2) : updatedValue(b);
+      if (a_value !== b_value) {
+        return (a_value < b_value ? -1 : 1) * direction;
+      }
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+  }
+
+  function clearFilters() {
+    status_filters = [];
+    type_filters = [];
+    search_text = '';
+    search_draft = '';
+    if (search_timer) {
+      clearTimeout(search_timer);
+      search_timer = null;
+    }
+    if (store) {
+      store.setState({ filters: { status: [], type: [], search: '' } });
+    }
+    void load();
+  }
+
+  function openCreateIssue() {
+    const button = /** @type {HTMLButtonElement | null} */ (
+      document.getElementById('new-issue-btn')
+    );
+    button?.click();
+  }
 
   /**
    * Build lit-html template for the list view.
@@ -216,9 +305,15 @@ export function createListView(
     if (search_text) {
       const needle = search_text.toLowerCase();
       filtered = filtered.filter((it) => {
-        const a = String(it.id).toLowerCase();
-        const b = String(it.title || '').toLowerCase();
-        return a.includes(needle) || b.includes(needle);
+        const searchable = [
+          it.id,
+          it.title || '',
+          it.assignee || '',
+          ...(Array.isArray(it.labels) ? it.labels : [])
+        ];
+        return searchable.some((value) =>
+          String(value).toLowerCase().includes(needle)
+        );
       });
     }
     if (type_filters.length > 0) {
@@ -226,10 +321,11 @@ export function createListView(
         type_filters.includes(String(it.issue_type || ''))
       );
     }
-    // Sorting: closed list is a special case → sort by closed_at desc only
-    if (status_filters.length === 1 && status_filters[0] === 'closed') {
-      filtered = filtered.slice().sort(cmpClosedDesc);
-    }
+    filtered = sortIssues(filtered);
+    const has_active_filters =
+      status_filters.length > 0 ||
+      type_filters.length > 0 ||
+      search_text !== '';
 
     return html`
       <div class="panel__header">
@@ -237,11 +333,14 @@ export function createListView(
           <button
             class="filter-dropdown__trigger"
             @click=${toggleStatusDropdown}
+            aria-expanded=${String(status_dropdown_open)}
+            aria-controls="status-filter-menu"
+            aria-haspopup="true"
           >
             ${getDropdownDisplayText(status_filters, 'Status', statusLabel)}
             <span class="filter-dropdown__arrow">▾</span>
           </button>
-          <div class="filter-dropdown__menu">
+          <div class="filter-dropdown__menu" id="status-filter-menu">
             ${['ready', 'open', 'in_progress', 'closed'].map(
               (s) => html`
                 <label class="filter-dropdown__option">
@@ -257,11 +356,17 @@ export function createListView(
           </div>
         </div>
         <div class="filter-dropdown ${type_dropdown_open ? 'is-open' : ''}">
-          <button class="filter-dropdown__trigger" @click=${toggleTypeDropdown}>
+          <button
+            class="filter-dropdown__trigger"
+            @click=${toggleTypeDropdown}
+            aria-expanded=${String(type_dropdown_open)}
+            aria-controls="type-filter-menu"
+            aria-haspopup="true"
+          >
             ${getDropdownDisplayText(type_filters, 'Types', typeLabel)}
             <span class="filter-dropdown__arrow">▾</span>
           </button>
-          <div class="filter-dropdown__menu">
+          <div class="filter-dropdown__menu" id="type-filter-menu">
             ${ISSUE_TYPES.map(
               (t) => html`
                 <label class="filter-dropdown__option">
@@ -279,21 +384,42 @@ export function createListView(
         <input
           type="search"
           placeholder="Search…"
+          aria-label="Search issues by ID, title, assignee, or label"
           @input=${onSearchInput}
-          .value=${search_text}
+          .value=${search_draft}
         />
       </div>
       <div class="panel__body" id="list-root">
+        ${issues_cache.length >= 1000
+          ? html`<div class="list-boundary-notice" role="status">
+              Showing up to 1000 issues.
+            </div>`
+          : null}
         ${filtered.length === 0
           ? html`<div class="issues-block">
-              <div class="muted" style="padding:10px 12px;">No issues</div>
+              <div class="list-empty-state">
+                <div class="muted">
+                  ${has_active_filters ? 'No matching issues' : 'No issues'}
+                </div>
+                ${has_active_filters
+                  ? html`<button type="button" @click=${clearFilters}>
+                      Clear filters
+                    </button>`
+                  : html`<button
+                      type="button"
+                      class="primary"
+                      @click=${openCreateIssue}
+                    >
+                      Create issue
+                    </button>`}
+              </div>
             </div>`
           : html`<div class="issues-block">
               <table
                 class="table"
                 role="grid"
                 aria-rowcount=${String(filtered.length)}
-                aria-colcount="6"
+                aria-colcount="8"
               >
                 <colgroup>
                   <col style="width: 100px" />
@@ -302,6 +428,7 @@ export function createListView(
                   <col style="width: 120px" />
                   <col style="width: 160px" />
                   <col style="width: 130px" />
+                  <col style="width: 180px" />
                   <col style="width: 80px" />
                 </colgroup>
                 <thead>
@@ -311,7 +438,38 @@ export function createListView(
                     <th role="columnheader">Title</th>
                     <th role="columnheader">Status</th>
                     <th role="columnheader">Assignee</th>
-                    <th role="columnheader">Priority</th>
+                    <th
+                      role="columnheader"
+                      aria-sort=${sort_key === 'priority'
+                        ? sort_direction === 'asc'
+                          ? 'ascending'
+                          : 'descending'
+                        : 'none'}
+                    >
+                      <button
+                        type="button"
+                        class="sort-header"
+                        @click=${() => toggleSort('priority')}
+                      >
+                        Priority
+                      </button>
+                    </th>
+                    <th
+                      role="columnheader"
+                      aria-sort=${sort_key === 'updated'
+                        ? sort_direction === 'asc'
+                          ? 'ascending'
+                          : 'descending'
+                        : 'none'}
+                    >
+                      <button
+                        type="button"
+                        class="sort-header"
+                        @click=${() => toggleSort('updated')}
+                      >
+                        Updated
+                      </button>
+                    </th>
                     <th role="columnheader">Deps</th>
                   </tr>
                 </thead>
@@ -342,24 +500,31 @@ export function createListView(
    * @param {{ [k: string]: any }} patch
    */
   async function updateInline(id, patch) {
-    try {
-      log('updateInline %s %o', id, Object.keys(patch));
-      // Dispatch specific mutations based on provided keys
-      if (typeof patch.title === 'string') {
-        await sendFn('edit-text', { id, field: 'title', value: patch.title });
-      }
-      if (typeof patch.assignee === 'string') {
-        await sendFn('update-assignee', { id, assignee: patch.assignee });
-      }
-      if (typeof patch.status === 'string') {
-        await sendFn('update-status', { id, status: patch.status });
-      }
-      if (typeof patch.priority === 'number') {
-        await sendFn('update-priority', { id, priority: patch.priority });
-      }
-    } catch {
-      // ignore failures; UI state remains as-is
+    log('updateInline %s %o', id, Object.keys(patch));
+    let result = null;
+    if (typeof patch.title === 'string') {
+      result = await sendFn('edit-text', {
+        id,
+        field: 'title',
+        value: patch.title
+      });
     }
+    if (typeof patch.assignee === 'string') {
+      result = await sendFn('update-assignee', {
+        id,
+        assignee: patch.assignee
+      });
+    }
+    if (typeof patch.status === 'string') {
+      result = await sendFn('update-status', { id, status: patch.status });
+    }
+    if (typeof patch.priority === 'number') {
+      result = await sendFn('update-priority', {
+        id,
+        priority: patch.priority
+      });
+    }
+    return result;
   }
 
   /**
@@ -543,6 +708,7 @@ export function createListView(
         }
         if (next_search !== search_text) {
           search_text = next_search;
+          search_draft = next_search;
           needs_render = true;
         }
         const next_type_arr = normalizeTypeFilter(s.filters.type);
@@ -579,6 +745,10 @@ export function createListView(
     load,
     destroy() {
       mount_element.replaceChildren();
+      if (search_timer) {
+        clearTimeout(search_timer);
+        search_timer = null;
+      }
       document.removeEventListener('click', clickOutsideHandler);
       if (unsubscribe) {
         unsubscribe();

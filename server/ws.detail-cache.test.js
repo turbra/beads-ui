@@ -1,11 +1,12 @@
 import fs from 'node:fs';
+import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { getGitUserName, runBd, runBdJson } from './bd.js';
 import { fetchListForSubscription } from './list-adapters.js';
 import { registry } from './subscriptions.js';
-import { handleMessage } from './ws.js';
+import { attachWsServer, handleMessage, scheduleListRefresh } from './ws.js';
 
 vi.mock('./bd.js', () => ({
   runBd: vi.fn(),
@@ -210,6 +211,31 @@ describe('issue-detail snapshot cache', () => {
     const second_sock = createSocket();
     await subscribeDetail(second_sock, issue_id);
     expect(mockedFetch).toHaveBeenCalledTimes(2);
+  });
+
+  test('detail refresh repopulates the detail cache generation', async () => {
+    const issue_id = 'CACHE-REFRESH-1';
+    mockedFetch.mockResolvedValue({ ok: true, items: detailItems(issue_id) });
+    mockedRunBd.mockResolvedValue({ code: 0, stdout: '', stderr: '' });
+    mockedRunBdJson.mockResolvedValue({
+      code: 0,
+      stdoutJson: { id: issue_id, status: 'closed' }
+    });
+    const server = createServer();
+    const { wss } = attachWsServer(server, { path: '/ws' });
+    const first_sock = createSocket();
+    wss.clients.add(/** @type {any} */ (first_sock));
+    await subscribeDetail(first_sock, issue_id);
+
+    await sendStatusMutation(first_sock, issue_id);
+    await scheduleListRefresh();
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+
+    const second_sock = createSocket();
+    await subscribeDetail(second_sock, issue_id);
+
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+    wss.close();
   });
 });
 

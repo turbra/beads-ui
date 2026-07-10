@@ -65,6 +65,12 @@ vi.mock('./ws.js', () => {
   return { createWsClient: () => singleton };
 });
 
+async function flushBootstrap() {
+  for (let index = 0; index < 8; index += 1) {
+    await Promise.resolve();
+  }
+}
+
 describe('push stores integration (board view)', () => {
   test('updates only the matching column on push events (multi-sub isolation)', async () => {
     const client = /** @type {any} */ (createWsClient());
@@ -74,7 +80,7 @@ describe('push stores integration (board view)', () => {
 
     bootstrap(root);
     // Allow router + subscriptions to wire
-    await Promise.resolve();
+    await flushBootstrap();
 
     // Initial board: no cards
     expect(document.querySelectorAll('#ready-col .board-card').length).toBe(0);
@@ -144,7 +150,7 @@ describe('push stores integration (board view)', () => {
     const root = /** @type {HTMLElement} */ (document.getElementById('app'));
 
     bootstrap(root);
-    await Promise.resolve();
+    await flushBootstrap();
 
     // Initial snapshot
     client._trigger('snapshot', {

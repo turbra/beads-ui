@@ -54,6 +54,8 @@ See `bdui --help` for options.
 - `BD_BIN`: path to the `bd` binary.
 - `BDUI_RUNTIME_DIR`: override runtime directory for PID/logs. Defaults to
   `$XDG_RUNTIME_DIR/beads-ui` or the system temp dir.
+- `BDUI_BD_TIMEOUT_MS`: maximum time for a `bd` command in milliseconds (default
+  `30000`). Set to `0` to disable the deadline.
 - `HOST`: overrides the bind address (default `127.0.0.1`).
 - `PORT`: overrides the listen port (default `3000`).
 

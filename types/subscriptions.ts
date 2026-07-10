@@ -44,6 +44,7 @@ export type SubscriptionType =
   | 'blocked-issues'
   | 'ready-issues'
   | 'in-progress-issues'
+  | 'status-issues'
   | 'closed-issues'
   | 'issue-detail';
 

@@ -26,6 +26,19 @@ import { debug } from './utils/logging.js';
  */
 
 /**
+ * Create a structured transport error so higher layers can preserve replayable
+ * subscription intent without suppressing server-side command failures.
+ *
+ * @param {'ws_disconnected'|'ws_connection_failed'|'ws_send_failed'|'ws_client_closed'} code
+ * @param {string} message
+ */
+function makeTransportError(code, message) {
+  const error = new Error(message);
+  Object.assign(error, { code });
+  return error;
+}
+
+/**
  * Create a WebSocket client with auto-reconnect and message correlation.
  *
  * @param {ClientOptions} [options]
@@ -67,9 +80,14 @@ export function createWsClient(options = {}) {
   /** @type {boolean} */
   let should_reconnect = true;
 
-  /** @type {Map<string, { resolve: (v: any) => void, reject: (e: any) => void, type: string }>} */
+  /** @type {number} */
+  let generation_counter = 0;
+  /** @type {number | null} */
+  let active_generation = null;
+
+  /** @type {Map<string, { resolve: (v: any) => void, reject: (e: any) => void, type: string, generation: number | null }>} */
   const pending = new Map();
-  /** @type {Array<ReturnType<typeof makeRequest>>} */
+  /** @type {Array<{ req: ReturnType<typeof makeRequest>, generation: number | null }>} */
   const queue = [];
   /** @type {Map<string, Set<(payload: any) => void>>} */
   const handlers = new Map();
@@ -112,31 +130,101 @@ export function createWsClient(options = {}) {
     }, delay);
   }
 
-  /** @param {ReturnType<typeof makeRequest>} req */
-  function sendRaw(req) {
+  /**
+   * @param {WebSocket} socket
+   * @param {ReturnType<typeof makeRequest>} req
+   */
+  function sendRaw(socket, req) {
     try {
-      ws?.send(JSON.stringify(req));
+      socket.send(JSON.stringify(req));
     } catch (err) {
       log('ws send failed', err);
+      const entry = pending.get(req.id);
+      if (entry) {
+        pending.delete(req.id);
+        entry.reject(makeTransportError('ws_send_failed', 'ws send failed'));
+      }
     }
   }
 
-  function onOpen() {
+  /**
+   * Reject requests owned by a failed connection attempt.
+   *
+   * @param {number} generation
+   * @param {Error} error
+   */
+  function rejectGeneration(generation, error) {
+    for (const [id, entry] of pending.entries()) {
+      if (entry.generation === generation) {
+        pending.delete(id);
+        entry.reject(error);
+      }
+    }
+    for (let index = queue.length - 1; index >= 0; index -= 1) {
+      if (queue[index].generation === generation) {
+        queue.splice(index, 1);
+      }
+    }
+  }
+
+  /** @param {Error} error */
+  function rejectAll(error) {
+    for (const [id, entry] of pending.entries()) {
+      pending.delete(id);
+      entry.reject(error);
+    }
+    queue.length = 0;
+  }
+
+  /** @param {number} generation */
+  function claimQueuedRequests(generation) {
+    for (const queued of queue) {
+      if (queued.generation !== null) {
+        continue;
+      }
+      queued.generation = generation;
+      const entry = pending.get(queued.req.id);
+      if (entry) {
+        entry.generation = generation;
+      }
+    }
+  }
+
+  /**
+   * @param {WebSocket} socket
+   * @param {number} generation
+   */
+  function onOpen(socket, generation) {
+    if (ws !== socket || active_generation !== generation) {
+      return;
+    }
     state = 'open';
     log('ws open');
     notifyConnection(state);
     attempts = 0;
     // flush queue
-    while (queue.length) {
-      const req = queue.shift();
-      if (req) {
-        sendRaw(req);
+    for (let index = 0; index < queue.length; ) {
+      const queued = queue[index];
+      if (queued.generation !== generation) {
+        index += 1;
+        continue;
+      }
+      queue.splice(index, 1);
+      if (pending.has(queued.req.id)) {
+        sendRaw(socket, queued.req);
       }
     }
   }
 
-  /** @param {MessageEvent} ev */
-  function onMessage(ev) {
+  /**
+   * @param {WebSocket} socket
+   * @param {number} generation
+   * @param {MessageEvent} ev
+   */
+  function onMessage(socket, generation, ev) {
+    if (ws !== socket || active_generation !== generation) {
+      return;
+    }
     /** @type {any} */
     let msg;
     try {
@@ -176,15 +264,23 @@ export function createWsClient(options = {}) {
     }
   }
 
-  function onClose() {
+  /**
+   * @param {WebSocket} socket
+   * @param {number} generation
+   */
+  function onClose(socket, generation) {
+    if (ws !== socket || active_generation !== generation) {
+      return;
+    }
+    ws = null;
+    active_generation = null;
     state = 'closed';
     log('ws closed');
     notifyConnection(state);
-    // fail all pending
-    for (const [id, p] of pending.entries()) {
-      p.reject(new Error('ws disconnected'));
-      pending.delete(id);
-    }
+    rejectGeneration(
+      generation,
+      makeTransportError('ws_disconnected', 'ws disconnected')
+    );
     attempts += 1;
     scheduleReconnect();
   }
@@ -193,20 +289,34 @@ export function createWsClient(options = {}) {
     if (!should_reconnect) {
       return;
     }
+    const generation = ++generation_counter;
+    active_generation = generation;
+    state = 'connecting';
+    notifyConnection(state);
+    claimQueuedRequests(generation);
     const url = resolveUrl();
     try {
-      ws = new WebSocket(url);
+      const socket = new WebSocket(url);
+      ws = socket;
       log('ws connecting %s', url);
-      state = 'connecting';
-      notifyConnection(state);
-      ws.addEventListener('open', onOpen);
-      ws.addEventListener('message', onMessage);
-      ws.addEventListener('error', () => {
+      socket.addEventListener('open', () => onOpen(socket, generation));
+      socket.addEventListener('message', (event) =>
+        onMessage(socket, generation, event)
+      );
+      socket.addEventListener('error', () => {
         // let close handler handle reconnect
       });
-      ws.addEventListener('close', onClose);
+      socket.addEventListener('close', () => onClose(socket, generation));
     } catch (err) {
       log('ws connect failed %o', err);
+      active_generation = null;
+      state = 'closed';
+      notifyConnection(state);
+      rejectGeneration(
+        generation,
+        makeTransportError('ws_connection_failed', 'ws connection failed')
+      );
+      attempts += 1;
       scheduleReconnect();
     }
   }
@@ -225,16 +335,22 @@ export function createWsClient(options = {}) {
       if (!MESSAGE_TYPES.includes(type)) {
         return Promise.reject(new Error(`unknown message type: ${type}`));
       }
+      if (!should_reconnect) {
+        return Promise.reject(
+          makeTransportError('ws_client_closed', 'ws client closed')
+        );
+      }
       const id = nextId();
       const req = makeRequest(type, payload, id);
       log('send %s id=%s', type, id);
       return new Promise((resolve, reject) => {
-        pending.set(id, { resolve, reject, type });
+        const generation = active_generation;
+        pending.set(id, { resolve, reject, type, generation });
         if (ws && ws.readyState === ws.OPEN) {
-          sendRaw(req);
+          sendRaw(ws, req);
         } else {
           log('queue %s id=%s (state=%s)', type, id, state);
-          queue.push(req);
+          queue.push({ req, generation });
         }
       });
     },
@@ -275,6 +391,7 @@ export function createWsClient(options = {}) {
         clearTimeout(reconnect_timer);
         reconnect_timer = null;
       }
+      rejectAll(makeTransportError('ws_client_closed', 'ws client closed'));
       try {
         ws?.close();
       } catch {

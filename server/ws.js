@@ -3,6 +3,7 @@
  * @import { RawData, WebSocket } from 'ws'
  * @import { MessageType } from '../app/protocol.js'
  */
+import { Buffer } from 'node:buffer';
 import path from 'node:path';
 import { WebSocketServer } from 'ws';
 import { isRequest, makeError, makeOk } from '../app/protocol.js';
@@ -12,7 +13,10 @@ import { fetchListForSubscription } from './list-adapters.js';
 import { debug } from './logging.js';
 import { getAvailableWorkspaces } from './registry-watcher.js';
 import { keyOf, registry } from './subscriptions.js';
-import { validateSubscribeListPayload } from './validators.js';
+import {
+  SUBSCRIPTION_DELTA_CAPABILITY,
+  validateSubscribeListPayload
+} from './validators.js';
 
 const log = debug('ws');
 
@@ -28,7 +32,11 @@ const BOARD_LIST_CLIENT_TYPES = new Map([
   ['tab:board:blocked', 'blocked-issues']
 ]);
 
-/** @type {Map<string, { items: SubscriptionIssue[] }>} */
+export const MAX_CONNECTION_SUBSCRIPTIONS = 32;
+export const MAX_PUSH_FRAME_BYTES = 8 * 1024 * 1024;
+export const MAX_SOCKET_BUFFERED_BYTES = 8 * 1024 * 1024;
+
+/** @type {Map<string, { items: SubscriptionIssue[], truncated: boolean }>} */
 const BOARD_LIST_CACHE = new Map();
 /** @type {Map<string, Promise<FetchListResult>>} */
 const BOARD_LIST_INFLIGHT = new Map();
@@ -37,7 +45,7 @@ const BOARD_LIST_INFLIGHT = new Map();
  * live between database change events: both caches are cleared on
  * watcher-driven refresh, mutations, and workspace switch.
  */
-/** @type {Map<string, { items: SubscriptionIssue[] }>} */
+/** @type {Map<string, { items: SubscriptionIssue[], truncated: boolean }>} */
 const ISSUE_DETAIL_CACHE = new Map();
 /** @type {Map<string, unknown>} */
 const COMMENTS_CACHE = new Map();
@@ -47,6 +55,11 @@ let BOARD_LIST_PREWARM_PROMISE = null;
 let BOARD_LIST_CACHE_GENERATION = 0;
 let DETAIL_CACHE_GENERATION = 0;
 let BOARD_LIST_PREWARM_ENABLED = false;
+let BOARD_SUBSCRIPTION_PREWARM_GENERATION = -1;
+let EVENT_SEQUENCE = 0;
+let RUNTIME_GENERATION = 0;
+/** @type {ReturnType<typeof setTimeout> | null} */
+let STARTUP_PREWARM_TIMER = null;
 
 /**
  * Debounced refresh scheduling for active list subscriptions.
@@ -55,6 +68,13 @@ let BOARD_LIST_PREWARM_ENABLED = false;
 /** @type {ReturnType<typeof setTimeout> | null} */
 let REFRESH_TIMER = null;
 let REFRESH_DEBOUNCE_MS = 75;
+/** @type {Promise<void> | null} */
+let REFRESH_CYCLE_PROMISE = null;
+/** @type {(() => void) | null} */
+let RESOLVE_REFRESH_CYCLE = null;
+/** @type {Promise<void> | null} */
+let REFRESH_RUNNING_PROMISE = null;
+let REFRESH_DIRTY = false;
 
 /**
  * Mutation refresh window gate. When active, watcher-driven list refresh
@@ -67,6 +87,8 @@ let REFRESH_DEBOUNCE_MS = 75;
  * @property {boolean} resolved
  * @property {(reason: 'watcher'|'timeout') => void} resolve
  * @property {ReturnType<typeof setTimeout>} timer
+ * @property {Promise<void>} completion
+ * @property {() => void} complete
  */
 /** @type {MutationGate | null} */
 let MUTATION_GATE = null;
@@ -88,11 +110,21 @@ function triggerMutationRefreshOnce(timeout_ms = 500) {
   if (MUTATION_GATE) {
     return;
   }
+  if (REFRESH_TIMER) {
+    clearTimeout(REFRESH_TIMER);
+    REFRESH_TIMER = null;
+  }
   /** @type {(r: 'watcher'|'timeout') => void} */
   let doResolve = () => {};
   const p = new Promise((resolve) => {
     doResolve = resolve;
   });
+  /** @type {(value?: void | PromiseLike<void>) => void} */
+  let resolve_completion = () => {};
+  const completion = new Promise((resolve) => {
+    resolve_completion = resolve;
+  });
+  const runtime_generation = RUNTIME_GENERATION;
   MUTATION_GATE = {
     resolved: false,
     resolve: (reason) => {
@@ -112,7 +144,9 @@ function triggerMutationRefreshOnce(timeout_ms = 500) {
       } catch {
         // ignore
       }
-    }, timeout_ms)
+    }, timeout_ms),
+    completion,
+    complete: resolve_completion
   };
   MUTATION_GATE.timer.unref?.();
 
@@ -120,10 +154,9 @@ function triggerMutationRefreshOnce(timeout_ms = 500) {
   void p.then(async () => {
     log('mutation window resolved → refresh active subs');
     try {
-      await refreshAllActiveListSubscriptions();
-    } catch {
-      // ignore refresh errors
-    } finally {
+      if (runtime_generation !== RUNTIME_GENERATION) {
+        return;
+      }
       try {
         if (MUTATION_GATE?.timer) {
           clearTimeout(MUTATION_GATE.timer);
@@ -132,6 +165,11 @@ function triggerMutationRefreshOnce(timeout_ms = 500) {
         // ignore
       }
       MUTATION_GATE = null;
+      await queueListRefresh(true);
+    } catch {
+      // ignore refresh errors
+    } finally {
+      resolve_completion();
     }
   });
 }
@@ -184,13 +222,12 @@ async function refreshAllActiveListSubscriptions() {
       }
     })
   );
-  if (BOARD_LIST_PREWARM_ENABLED) {
-    void scheduleBoardListPrewarm();
-  }
 }
 
 /**
  * Schedule a coalesced refresh of all active list subscriptions.
+ *
+ * @returns {Promise<void>}
  */
 export function scheduleListRefresh() {
   // Suppress watcher-driven refreshes during an active mutation gate; resolve gate once
@@ -200,24 +237,76 @@ export function scheduleListRefresh() {
     } catch {
       // ignore
     }
-    return;
+    return MUTATION_GATE.completion;
+  }
+  return queueListRefresh(false);
+}
+
+/**
+ * Queue one refresh cycle. Calls during the debounce reset it; calls during an
+ * active run mark one immediate trailing pass.
+ *
+ * @param {boolean} immediate
+ * @returns {Promise<void>}
+ */
+function queueListRefresh(immediate) {
+  if (REFRESH_RUNNING_PROMISE) {
+    REFRESH_DIRTY = true;
+    return REFRESH_CYCLE_PROMISE || REFRESH_RUNNING_PROMISE;
+  }
+  if (!REFRESH_CYCLE_PROMISE) {
+    REFRESH_CYCLE_PROMISE = new Promise((resolve) => {
+      RESOLVE_REFRESH_CYCLE = resolve;
+    });
   }
   if (REFRESH_TIMER) {
     clearTimeout(REFRESH_TIMER);
   }
-  REFRESH_TIMER = setTimeout(() => {
-    REFRESH_TIMER = null;
-    // Fire and forget; callers don't await scheduling
-    void refreshAllActiveListSubscriptions();
-  }, REFRESH_DEBOUNCE_MS);
+  const runtime_generation = RUNTIME_GENERATION;
+  REFRESH_TIMER = setTimeout(
+    () => {
+      REFRESH_TIMER = null;
+      if (runtime_generation !== RUNTIME_GENERATION) {
+        return;
+      }
+      REFRESH_RUNNING_PROMISE = runRefreshCycle(runtime_generation).finally(
+        () => {
+          if (runtime_generation !== RUNTIME_GENERATION) {
+            return;
+          }
+          REFRESH_RUNNING_PROMISE = null;
+          const resolve_cycle = RESOLVE_REFRESH_CYCLE;
+          RESOLVE_REFRESH_CYCLE = null;
+          REFRESH_CYCLE_PROMISE = null;
+          resolve_cycle?.();
+        }
+      );
+    },
+    immediate ? 0 : REFRESH_DEBOUNCE_MS
+  );
   REFRESH_TIMER.unref?.();
+  return REFRESH_CYCLE_PROMISE;
+}
+
+/**
+ * Run the active refresh and any single dirty trailing pass.
+ *
+ * @param {number} runtime_generation
+ */
+async function runRefreshCycle(runtime_generation) {
+  do {
+    REFRESH_DIRTY = false;
+    await refreshAllActiveListSubscriptions();
+  } while (REFRESH_DIRTY && runtime_generation === RUNTIME_GENERATION);
 }
 
 /**
  * @typedef {{
  *   show_id?: string | null,
- *   list_subs?: Map<string, { key: string, spec: { type: string, params?: Record<string, string | number | boolean> } }>,
- *   list_revisions?: Map<string, number>
+ *   list_subs?: Map<string, { key: string, spec: { type: string, params?: Record<string, string | number | boolean> }, capabilities: string[], intent: number }>,
+ *   list_revisions?: Map<string, number>,
+ *   subscribe_intents?: Map<string, number>,
+ *   pending_subscriptions?: Map<string, number>
  * }} ConnectionSubs
  */
 
@@ -253,7 +342,9 @@ function ensureSubs(ws) {
     s = {
       show_id: null,
       list_subs: new Map(),
-      list_revisions: new Map()
+      list_revisions: new Map(),
+      subscribe_intents: new Map(),
+      pending_subscriptions: new Map()
     };
     SUBS.set(ws, s);
   }
@@ -261,12 +352,124 @@ function ensureSubs(ws) {
 }
 
 /**
- * Get next monotonically increasing revision for a subscription key on this connection.
+ * Supersede prior subscribe or unsubscribe work for a client-chosen id.
  *
  * @param {WebSocket} ws
- * @param {string} key
+ * @param {string} client_id
  */
+function nextSubscribeIntent(ws, client_id) {
+  const s = ensureSubs(ws);
+  const intents = s.subscribe_intents || new Map();
+  s.subscribe_intents = intents;
+  const intent = (intents.get(client_id) || 0) + 1;
+  intents.set(client_id, intent);
+  return intent;
+}
+
 /**
+ * @param {WebSocket} ws
+ * @param {string} client_id
+ * @param {number} intent
+ */
+function isSubscribeIntentCurrent(ws, client_id, intent) {
+  return ensureSubs(ws).subscribe_intents?.get(client_id) === intent;
+}
+
+/**
+ * Reserve a distinct client subscription id before starting its initial fetch.
+ * Replacing the same id transfers the existing reservation to the new intent.
+ *
+ * @param {WebSocket} ws
+ * @param {string} client_id
+ * @returns {number | null}
+ */
+function beginSubscribeIntent(ws, client_id) {
+  const s = ensureSubs(ws);
+  const active = s.list_subs || new Map();
+  const pending = s.pending_subscriptions || new Map();
+  s.list_subs = active;
+  s.pending_subscriptions = pending;
+
+  if (!active.has(client_id) && !pending.has(client_id)) {
+    /** @type {Set<string>} */
+    const reserved_ids = new Set([...active.keys(), ...pending.keys()]);
+    if (reserved_ids.size >= MAX_CONNECTION_SUBSCRIPTIONS) {
+      return null;
+    }
+  }
+
+  const intent = nextSubscribeIntent(ws, client_id);
+  pending.set(client_id, intent);
+  return intent;
+}
+
+/**
+ * Release only the reservation owned by this exact pending intent.
+ *
+ * @param {WebSocket} ws
+ * @param {string} client_id
+ * @param {number} intent
+ */
+function finishSubscribeIntent(ws, client_id, intent) {
+  const pending = ensureSubs(ws).pending_subscriptions;
+  if (pending?.get(client_id) === intent) {
+    pending.delete(client_id);
+  }
+}
+
+/**
+ * Return whether another active id on this connection references a key.
+ *
+ * @param {ConnectionSubs} s
+ * @param {string} key
+ * @param {string} [excluded_id]
+ */
+function hasConnectionSubscriptionForKey(s, key, excluded_id = '') {
+  const subscriptions = s.list_subs || new Map();
+  for (const [client_id, subscription] of subscriptions) {
+    if (client_id !== excluded_id && subscription.key === key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Remove an active id and detach the socket only when no sibling id uses the key.
+ *
+ * @param {WebSocket} ws
+ * @param {string} client_id
+ * @param {number} [expected_intent]
+ */
+function detachClientSubscription(ws, client_id, expected_intent) {
+  const s = ensureSubs(ws);
+  const subscription = s.list_subs?.get(client_id);
+  if (!subscription) {
+    return false;
+  }
+  if (
+    expected_intent !== undefined &&
+    subscription.intent !== expected_intent
+  ) {
+    return false;
+  }
+  s.list_subs?.delete(client_id);
+  if (!hasConnectionSubscriptionForKey(s, subscription.key)) {
+    registry.detach(subscription.spec, ws);
+  }
+  return true;
+}
+
+/**
+ * @param {WebSocket} ws
+ */
+function isSocketOpen(ws) {
+  return ws.readyState === ws.OPEN;
+}
+
+/**
+ * Get next monotonically increasing revision for a subscription key on this connection.
+ *
  * @param {WebSocket} ws
  * @param {string} key
  */
@@ -281,88 +484,194 @@ function nextListRevision(ws, key) {
 }
 
 /**
- * Emit per-subscription envelopes to a specific client id on a socket.
- * Helpers for snapshot / upsert / delete.
+ * @param {WebSocket} ws
+ * @param {string} key
  */
+function currentListRevision(ws, key) {
+  return ensureSubs(ws).list_revisions?.get(key) || 0;
+}
+
+/**
+ * Restore a revision reserved for an initial snapshot that was not enqueued.
+ * The per-key registry lock prevents a concurrent event from using the value.
+ *
+ * @param {WebSocket} ws
+ * @param {string} key
+ * @param {number} revision
+ */
+function restoreListRevision(ws, key, revision) {
+  const revisions = ensureSubs(ws).list_revisions;
+  if (!revisions) {
+    return;
+  }
+  if (revision === 0) {
+    revisions.delete(key);
+  } else {
+    revisions.set(key, revision);
+  }
+}
+
+/** @typedef {{ encoded: string, bytes: number }} PreparedPushFrame */
+
+/**
+ * Encode one push envelope and retain its exact wire size.
+ *
+ * @param {'snapshot'|'upsert'|'delete'|'delta'} type
+ * @param {Record<string, unknown>} payload
+ * @returns {PreparedPushFrame}
+ */
+function preparePushFrame(type, payload) {
+  const encoded = JSON.stringify({
+    id: nextEventId(),
+    ok: true,
+    type: /** @type {MessageType} */ (type),
+    payload
+  });
+  return { encoded, bytes: Buffer.byteLength(encoded, 'utf8') };
+}
+
+/**
+ * @param {WebSocket} ws
+ * @param {PreparedPushFrame[]} frames
+ */
+function assertPushCapacity(ws, frames) {
+  let total_bytes = 0;
+  for (const frame of frames) {
+    if (frame.bytes > MAX_PUSH_FRAME_BYTES) {
+      throw resourceLimitError('Encoded push frame exceeds the 8 MiB limit');
+    }
+    total_bytes += frame.bytes;
+  }
+  const buffered_amount = Number(ws.bufferedAmount) || 0;
+  if (buffered_amount + total_bytes > MAX_SOCKET_BUFFERED_BYTES) {
+    throw resourceLimitError('Socket push buffer would exceed the 8 MiB limit');
+  }
+}
+
+/**
+ * @param {string} message
+ */
+function resourceLimitError(message) {
+  const error = new Error(message);
+  // @ts-expect-error structured transport error
+  error.code = 'resource_limit';
+  return error;
+}
+
+/**
+ * Preflight the complete delivery set before enqueuing its first frame.
+ *
+ * @param {WebSocket} ws
+ * @param {PreparedPushFrame[]} frames
+ */
+function sendPreparedPushFrames(ws, frames) {
+  assertPushCapacity(ws, frames);
+  for (const frame of frames) {
+    ws.send(frame.encoded);
+  }
+}
+
+/**
+ * Close a lagging connection so its reconnect starts from a fresh snapshot.
+ *
+ * @param {WebSocket} ws
+ * @param {unknown} err
+ */
+function closeForBackpressure(ws, err) {
+  log('closing lagging subscription connection: %o', err);
+  try {
+    ws.close(1013, 'subscription backpressure');
+  } catch {
+    try {
+      ws.terminate();
+    } catch {
+      // ignore close failures
+    }
+  }
+}
+
 /**
  * @param {WebSocket} ws
  * @param {string} client_id
  * @param {string} key
  * @param {Array<Record<string, unknown>>} issues
+ * @param {boolean} truncated
  */
-function emitSubscriptionSnapshot(ws, client_id, key, issues) {
-  const revision = nextListRevision(ws, key);
-  const payload = {
-    type: /** @type {const} */ ('snapshot'),
+function prepareSubscriptionSnapshot(ws, client_id, key, issues, truncated) {
+  return preparePushFrame('snapshot', {
+    type: 'snapshot',
     id: client_id,
-    revision,
-    issues
-  };
-  const msg = JSON.stringify({
-    id: `evt-${Date.now()}`,
-    ok: true,
-    type: /** @type {MessageType} */ ('snapshot'),
-    payload
+    revision: nextListRevision(ws, key),
+    issues,
+    truncated
   });
-  try {
-    ws.send(msg);
-  } catch (err) {
-    log('emit snapshot send failed key=%s id=%s: %o', key, client_id, err);
-  }
 }
 
 /**
+ * Build the complete refresh delivery for one socket and one registry key.
+ *
  * @param {WebSocket} ws
- * @param {string} client_id
  * @param {string} key
- * @param {Record<string, unknown>} issue
+ * @param {Array<[string, { capabilities: string[] }]>} subscriptions
+ * @param {string[]} changed_ids
+ * @param {string[]} removed_ids
+ * @param {Map<string, Record<string, unknown>>} by_id
  */
-function emitSubscriptionUpsert(ws, client_id, key, issue) {
-  const revision = nextListRevision(ws, key);
-  const payload = {
-    type: 'upsert',
-    id: client_id,
-    revision,
-    issue
-  };
-  const msg = JSON.stringify({
-    id: `evt-${Date.now()}`,
-    ok: true,
-    type: /** @type {MessageType} */ ('upsert'),
-    payload
-  });
-  try {
-    ws.send(msg);
-  } catch (err) {
-    log('emit upsert send failed key=%s id=%s: %o', key, client_id, err);
+function prepareSubscriptionChanges(
+  ws,
+  key,
+  subscriptions,
+  changed_ids,
+  removed_ids,
+  by_id
+) {
+  /** @type {PreparedPushFrame[]} */
+  const frames = [];
+  const total_changes = changed_ids.length + removed_ids.length;
+  for (const [client_id, subscription] of subscriptions) {
+    if (
+      total_changes >= 2 &&
+      subscription.capabilities.includes(SUBSCRIPTION_DELTA_CAPABILITY)
+    ) {
+      const upserts = changed_ids
+        .map((issue_id) => by_id.get(issue_id))
+        .filter((issue) => issue !== undefined);
+      frames.push(
+        preparePushFrame('delta', {
+          type: 'delta',
+          id: client_id,
+          revision: nextListRevision(ws, key),
+          upserts,
+          deletes: removed_ids
+        })
+      );
+      continue;
+    }
+    for (const issue_id of changed_ids) {
+      const issue = by_id.get(issue_id);
+      if (issue) {
+        frames.push(
+          preparePushFrame('upsert', {
+            type: 'upsert',
+            id: client_id,
+            revision: nextListRevision(ws, key),
+            issue
+          })
+        );
+      }
+    }
+    for (const issue_id of removed_ids) {
+      frames.push(
+        preparePushFrame('delete', {
+          type: 'delete',
+          id: client_id,
+          revision: nextListRevision(ws, key),
+          issue_id
+        })
+      );
+    }
   }
-}
-
-/**
- * @param {WebSocket} ws
- * @param {string} client_id
- * @param {string} key
- * @param {string} issue_id
- */
-function emitSubscriptionDelete(ws, client_id, key, issue_id) {
-  const revision = nextListRevision(ws, key);
-  const payload = {
-    type: 'delete',
-    id: client_id,
-    revision,
-    issue_id
-  };
-  const msg = JSON.stringify({
-    id: `evt-${Date.now()}`,
-    ok: true,
-    type: /** @type {MessageType} */ ('delete'),
-    payload
-  });
-  try {
-    ws.send(msg);
-  } catch (err) {
-    log('emit delete send failed key=%s id=%s: %o', key, client_id, err);
-  }
+  return frames;
 }
 
 // issues-changed removed in v2: detail and lists are pushed via subscriptions
@@ -377,6 +686,7 @@ async function refreshAndPublish(spec) {
   const key = keyOf(spec);
   await registry.withKeyLock(key, async () => {
     const generation = BOARD_LIST_CACHE_GENERATION;
+    const detail_generation = DETAIL_CACHE_GENERATION;
     // Detail refreshes update an open dialog; keep them ahead of list refreshes
     const is_detail = String(spec.type) === 'issue-detail';
     const res = await fetchListForSubscription(spec, {
@@ -387,15 +697,29 @@ async function refreshAndPublish(spec) {
       log('refresh failed for %s: %s %o', key, res.error.message, res.error);
       return;
     }
-    const items = applyClosedIssuesFilter(spec, res.items);
-    populateBoardListCache(spec, items, generation);
-    if (is_detail) {
-      populateIssueDetailCache(spec, items, generation);
+    if (
+      generation !== BOARD_LIST_CACHE_GENERATION ||
+      (is_detail && detail_generation !== DETAIL_CACHE_GENERATION)
+    ) {
+      log('discarding stale refresh result for %s', key);
+      return;
     }
-    const prev_size = registry.get(key)?.itemsById.size || 0;
+    const items = applyClosedIssuesFilter(spec, res.items);
+    const truncated = res.truncated === true;
+    populateBoardListCache(spec, items, generation, truncated);
+    if (is_detail) {
+      populateIssueDetailCache(spec, items, detail_generation, truncated);
+    }
+    const previous_entry = registry.get(key);
+    const was_initialized = previous_entry?.initialized === true;
+    const previous_truncated = previous_entry?.truncated === true;
     const delta = registry.applyItems(key, items);
     const entry = registry.get(key);
-    if (!entry || entry.subscribers.size === 0) {
+    if (!entry) {
+      return;
+    }
+    entry.truncated = truncated;
+    if (entry.subscribers.size === 0) {
       return;
     }
     /** @type {Map<string, any>} */
@@ -406,31 +730,46 @@ async function refreshAndPublish(spec) {
       }
     }
     for (const ws of entry.subscribers) {
-      if (ws.readyState !== ws.OPEN) continue;
-      const s = ensureSubs(ws);
-      const subs = s.list_subs || new Map();
-      /** @type {string[]} */
-      const client_ids = [];
-      for (const [cid, v] of subs.entries()) {
-        if (v.key === key) client_ids.push(cid);
-      }
-      if (client_ids.length === 0) continue;
-      if (prev_size === 0) {
-        for (const cid of client_ids) {
-          emitSubscriptionSnapshot(ws, cid, key, items);
-        }
+      if (!isSocketOpen(ws)) {
         continue;
       }
-      for (const cid of client_ids) {
-        for (const id of [...delta.added, ...delta.updated]) {
-          const issue = by_id.get(id);
-          if (issue) {
-            emitSubscriptionUpsert(ws, cid, key, issue);
+      const s = ensureSubs(ws);
+      const subs = s.list_subs || new Map();
+      /** @type {Array<[string, { capabilities: string[] }]>} */
+      const client_subscriptions = [];
+      for (const [cid, v] of subs.entries()) {
+        if (v.key === key) {
+          client_subscriptions.push([cid, v]);
+        }
+      }
+      if (client_subscriptions.length === 0) {
+        continue;
+      }
+      try {
+        /** @type {PreparedPushFrame[]} */
+        let frames = [];
+        if (!was_initialized || previous_truncated !== truncated) {
+          frames = client_subscriptions.map(([client_id]) =>
+            prepareSubscriptionSnapshot(ws, client_id, key, items, truncated)
+          );
+        } else {
+          const changed_ids = [...delta.added, ...delta.updated].sort();
+          const removed_ids = delta.removed.slice().sort();
+          if (changed_ids.length + removed_ids.length === 0) {
+            continue;
           }
+          frames = prepareSubscriptionChanges(
+            ws,
+            key,
+            client_subscriptions,
+            changed_ids,
+            removed_ids,
+            by_id
+          );
         }
-        for (const id of delta.removed) {
-          emitSubscriptionDelete(ws, cid, key, id);
-        }
+        sendPreparedPushFrames(ws, frames);
+      } catch (err) {
+        closeForBackpressure(ws, err);
       }
     }
   });
@@ -460,20 +799,6 @@ function applyClosedIssuesFilter(spec, items) {
     }
   }
   return out;
-}
-
-function defaultBoardClosedSince() {
-  const now = new Date();
-  const start = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate(),
-    0,
-    0,
-    0,
-    0
-  );
-  return start.getTime();
 }
 
 /**
@@ -573,8 +898,9 @@ function evictOldestCacheEntry(cache, limit) {
  * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
  * @param {SubscriptionIssue[]} items
  * @param {number} generation
+ * @param {boolean} truncated
  */
-function populateIssueDetailCache(spec, items, generation) {
+function populateIssueDetailCache(spec, items, generation, truncated = false) {
   if (generation !== DETAIL_CACHE_GENERATION) {
     return;
   }
@@ -583,7 +909,8 @@ function populateIssueDetailCache(spec, items, generation) {
     return;
   }
   ISSUE_DETAIL_CACHE.set(issueDetailCacheKey(issue_id), {
-    items: items.slice()
+    items: items.slice(),
+    truncated
   });
   evictOldestCacheEntry(ISSUE_DETAIL_CACHE, DETAIL_CACHE_LIMIT);
 }
@@ -604,14 +931,23 @@ async function fetchCachedIssueDetail(spec) {
   }
   const cached = ISSUE_DETAIL_CACHE.get(issueDetailCacheKey(issue_id));
   if (cached) {
-    return { ok: true, items: cached.items.slice() };
+    return {
+      ok: true,
+      items: cached.items.slice(),
+      truncated: cached.truncated
+    };
   }
   const generation = DETAIL_CACHE_GENERATION;
   const res = await fetchListForSubscription(spec, {
     cwd: CURRENT_WORKSPACE?.root_dir
   });
   if (res.ok) {
-    populateIssueDetailCache(spec, res.items, generation);
+    populateIssueDetailCache(
+      spec,
+      res.items,
+      generation,
+      res.truncated === true
+    );
   }
   return res;
 }
@@ -620,15 +956,19 @@ async function fetchCachedIssueDetail(spec) {
  * @param {{ type: string, params?: Record<string, string|number|boolean> }} spec
  * @param {SubscriptionIssue[]} items
  * @param {number} generation
+ * @param {boolean} truncated
  */
-function populateBoardListCache(spec, items, generation) {
+function populateBoardListCache(spec, items, generation, truncated = false) {
   if (
     generation !== BOARD_LIST_CACHE_GENERATION ||
     !isCacheableBoardListSpec(spec)
   ) {
     return;
   }
-  BOARD_LIST_CACHE.set(boardListCacheKey(spec), { items: items.slice() });
+  BOARD_LIST_CACHE.set(boardListCacheKey(spec), {
+    items: items.slice(),
+    truncated
+  });
 }
 
 /**
@@ -639,7 +979,11 @@ function cloneListResult(res) {
   if (!res.ok) {
     return res;
   }
-  return { ok: true, items: res.items.slice() };
+  return {
+    ok: true,
+    items: res.items.slice(),
+    truncated: res.truncated === true
+  };
 }
 
 /**
@@ -651,7 +995,11 @@ async function fetchCachedBoardListSubscription(spec, options = {}) {
   const cache_key = boardListCacheKey(spec);
   const cached = BOARD_LIST_CACHE.get(cache_key);
   if (cached) {
-    return { ok: true, items: cached.items.slice() };
+    return {
+      ok: true,
+      items: cached.items.slice(),
+      truncated: cached.truncated
+    };
   }
   const inflight = BOARD_LIST_INFLIGHT.get(cache_key);
   if (inflight) {
@@ -667,8 +1015,9 @@ async function fetchCachedBoardListSubscription(spec, options = {}) {
       return res;
     }
     const items = applyClosedIssuesFilter(spec, res.items).slice();
-    populateBoardListCache(spec, items, generation);
-    return /** @type {FetchListResult} */ ({ ok: true, items });
+    const truncated = res.truncated === true;
+    populateBoardListCache(spec, items, generation, truncated);
+    return /** @type {FetchListResult} */ ({ ok: true, items, truncated });
   });
   BOARD_LIST_INFLIGHT.set(cache_key, pending);
   try {
@@ -697,19 +1046,48 @@ async function fetchInitialListForSubscription(client_id, spec) {
   });
 }
 
+/** Capture all state that makes an initial subscription result current. */
+function captureInitialSubscriptionGeneration() {
+  return {
+    runtime: RUNTIME_GENERATION,
+    board_cache: BOARD_LIST_CACHE_GENERATION,
+    detail_cache: DETAIL_CACHE_GENERATION,
+    root_dir: CURRENT_WORKSPACE?.root_dir || '',
+    db_path: CURRENT_WORKSPACE?.db_path || ''
+  };
+}
+
+/**
+ * @param {ReturnType<typeof captureInitialSubscriptionGeneration>} generation
+ */
+function isInitialSubscriptionIdentityCurrent(generation) {
+  return (
+    generation.runtime === RUNTIME_GENERATION &&
+    generation.root_dir === (CURRENT_WORKSPACE?.root_dir || '') &&
+    generation.db_path === (CURRENT_WORKSPACE?.db_path || '')
+  );
+}
+
+/**
+ * Cache invalidation does not invalidate a same-workspace snapshot, but it does
+ * require a trailing refresh because the invalidating pass may not have seen
+ * the subscription before it attached.
+ *
+ * @param {{ type: string }} spec
+ * @param {ReturnType<typeof captureInitialSubscriptionGeneration>} generation
+ */
+function didRelevantInitialCacheGenerationChange(spec, generation) {
+  return String(spec.type) === 'issue-detail'
+    ? generation.detail_cache !== DETAIL_CACHE_GENERATION
+    : generation.board_cache !== BOARD_LIST_CACHE_GENERATION;
+}
+
 async function prewarmBoardListCache() {
   /** @type {{ priority: 'background' }} */
   const opts = { priority: 'background' };
   await Promise.all([
     fetchCachedBoardListSubscription({ type: 'ready-issues' }, opts),
     fetchCachedBoardListSubscription({ type: 'in-progress-issues' }, opts),
-    fetchCachedBoardListSubscription(
-      {
-        type: 'closed-issues',
-        params: { since: defaultBoardClosedSince() }
-      },
-      opts
-    ),
     fetchCachedBoardListSubscription({ type: 'blocked-issues' }, opts)
   ]);
 }
@@ -718,14 +1096,114 @@ function scheduleBoardListPrewarm() {
   if (BOARD_LIST_PREWARM_PROMISE) {
     return BOARD_LIST_PREWARM_PROMISE;
   }
-  BOARD_LIST_PREWARM_PROMISE = prewarmBoardListCache()
+  const pending = prewarmBoardListCache()
     .catch((err) => {
       log('board list prewarm failed: %o', err);
     })
     .finally(() => {
-      BOARD_LIST_PREWARM_PROMISE = null;
+      if (BOARD_LIST_PREWARM_PROMISE === pending) {
+        BOARD_LIST_PREWARM_PROMISE = null;
+      }
     });
-  return BOARD_LIST_PREWARM_PROMISE;
+  BOARD_LIST_PREWARM_PROMISE = pending;
+  return pending;
+}
+
+/** Create a process-unique server event identifier. */
+function nextEventId() {
+  EVENT_SEQUENCE = (EVENT_SEQUENCE + 1) % Number.MAX_SAFE_INTEGER;
+  return `evt-${Date.now()}-${EVENT_SEQUENCE}`;
+}
+
+/**
+ * Broadcast an event through the currently attached server.
+ *
+ * @param {MessageType} type
+ * @param {unknown} [payload]
+ * @param {WebSocket | null} [excluded_ws]
+ */
+function broadcastToCurrentClients(type, payload, excluded_ws = null) {
+  const wss = CURRENT_WSS;
+  if (!wss) {
+    return;
+  }
+  const msg = JSON.stringify({
+    id: nextEventId(),
+    ok: true,
+    type,
+    payload
+  });
+  for (const ws of wss.clients) {
+    if (ws !== excluded_ws && ws.readyState === ws.OPEN) {
+      ws.send(msg);
+    }
+  }
+}
+
+/**
+ * Update the selected workspace through the single cache/watcher path.
+ *
+ * @param {string} new_root_dir
+ * @param {WebSocket | null} [initiating_ws]
+ */
+function applyWorkspaceChange(new_root_dir, initiating_ws = null) {
+  const resolved_root = path.resolve(new_root_dir);
+  const new_db = resolveWorkspaceDatabase({ cwd: resolved_root });
+  const old_path = CURRENT_WORKSPACE?.db_path || '';
+  CURRENT_WORKSPACE = {
+    root_dir: resolved_root,
+    db_path: new_db.path
+  };
+  const changed = new_db.path !== old_path;
+  if (changed) {
+    log('workspace changed: %s → %s', old_path, new_db.path);
+    DB_WATCHER?.rebind({ root_dir: resolved_root });
+    registry.clear();
+    clearBoardListCache();
+    broadcastToCurrentClients(
+      'workspace-changed',
+      CURRENT_WORKSPACE,
+      initiating_ws
+    );
+    void scheduleListRefresh();
+  }
+  return { changed, workspace: CURRENT_WORKSPACE };
+}
+
+/**
+ * Cancel global work owned by the current WebSocket server. The generation
+ * guard keeps in-flight callbacks from mutating a subsequently attached one.
+ *
+ * @param {WebSocketServer | null} [expected_wss]
+ */
+function deactivateRuntime(expected_wss = null) {
+  if (expected_wss && CURRENT_WSS !== expected_wss) {
+    return;
+  }
+  RUNTIME_GENERATION += 1;
+  if (STARTUP_PREWARM_TIMER) {
+    clearTimeout(STARTUP_PREWARM_TIMER);
+    STARTUP_PREWARM_TIMER = null;
+  }
+  if (REFRESH_TIMER) {
+    clearTimeout(REFRESH_TIMER);
+    REFRESH_TIMER = null;
+  }
+  RESOLVE_REFRESH_CYCLE?.();
+  RESOLVE_REFRESH_CYCLE = null;
+  REFRESH_CYCLE_PROMISE = null;
+  REFRESH_RUNNING_PROMISE = null;
+  REFRESH_DIRTY = false;
+  if (MUTATION_GATE) {
+    clearTimeout(MUTATION_GATE.timer);
+    MUTATION_GATE.complete();
+    MUTATION_GATE = null;
+  }
+  registry.clear();
+  clearBoardListCache();
+  BOARD_LIST_PREWARM_ENABLED = false;
+  DB_WATCHER = null;
+  CURRENT_WSS = null;
 }
 
 /**
@@ -733,9 +1211,10 @@ function scheduleBoardListPrewarm() {
  *
  * @param {Server} http_server
  * @param {{ path?: string, heartbeat_ms?: number, refresh_debounce_ms?: number, root_dir?: string, watcher?: { rebind: (opts?: { root_dir?: string }) => void, path: string }, prewarm_board_cache?: boolean }} [options]
- * @returns {{ wss: WebSocketServer, broadcast: (type: MessageType, payload?: unknown) => void, scheduleListRefresh: () => void, prewarmBoardCache: () => Promise<void>, setWorkspace: (root_dir: string) => { changed: boolean, workspace: { root_dir: string, db_path: string } } }}
+ * @returns {{ wss: WebSocketServer, broadcast: (type: MessageType, payload?: unknown) => void, scheduleListRefresh: () => Promise<void>, prewarmBoardCache: () => Promise<void>, setWorkspace: (root_dir: string) => { changed: boolean, workspace: { root_dir: string, db_path: string } } }}
  */
 export function attachWsServer(http_server, options = {}) {
+  deactivateRuntime();
   const ws_path = options.path || '/ws';
 
   // Initialize workspace state
@@ -745,6 +1224,7 @@ export function attachWsServer(http_server, options = {}) {
     root_dir: initial_root,
     db_path: initial_db.path
   };
+  const attached_workspace = CURRENT_WORKSPACE;
   clearBoardListCache();
   BOARD_LIST_PREWARM_ENABLED = options.prewarm_board_cache === true;
 
@@ -761,6 +1241,7 @@ export function attachWsServer(http_server, options = {}) {
 
   const wss = new WebSocketServer({ server: http_server, path: ws_path });
   CURRENT_WSS = wss;
+  const runtime_generation = RUNTIME_GENERATION;
 
   // Heartbeat: track if client answered the last ping
   wss.on('connection', (ws) => {
@@ -782,6 +1263,12 @@ export function attachWsServer(http_server, options = {}) {
 
     ws.on('close', () => {
       try {
+        const s = ensureSubs(ws);
+        for (const client_id of s.pending_subscriptions?.keys() || []) {
+          nextSubscribeIntent(ws, client_id);
+        }
+        s.pending_subscriptions?.clear();
+        s.list_subs?.clear();
         registry.onDisconnect(ws);
       } catch {
         // ignore cleanup errors
@@ -806,13 +1293,18 @@ export function attachWsServer(http_server, options = {}) {
 
   wss.on('close', () => {
     clearInterval(interval);
+    deactivateRuntime(wss);
   });
 
   if (BOARD_LIST_PREWARM_ENABLED) {
-    const prewarm_timer = setTimeout(() => {
+    STARTUP_PREWARM_TIMER = setTimeout(() => {
+      STARTUP_PREWARM_TIMER = null;
+      if (runtime_generation !== RUNTIME_GENERATION) {
+        return;
+      }
       void scheduleBoardListPrewarm();
     }, 0);
-    prewarm_timer.unref?.();
+    STARTUP_PREWARM_TIMER.unref?.();
   }
 
   /**
@@ -822,17 +1314,10 @@ export function attachWsServer(http_server, options = {}) {
    * @param {unknown} [payload]
    */
   function broadcast(type, payload) {
-    const msg = JSON.stringify({
-      id: `evt-${Date.now()}`,
-      ok: true,
-      type,
-      payload
-    });
-    for (const ws of wss.clients) {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(msg);
-      }
+    if (runtime_generation !== RUNTIME_GENERATION || CURRENT_WSS !== wss) {
+      return;
     }
+    broadcastToCurrentClients(type, payload);
   }
 
   /**
@@ -842,44 +1327,26 @@ export function attachWsServer(http_server, options = {}) {
    * @returns {{ changed: boolean, workspace: { root_dir: string, db_path: string } }}
    */
   function setWorkspace(new_root_dir) {
-    const resolved_root = path.resolve(new_root_dir);
-    const new_db = resolveWorkspaceDatabase({ cwd: resolved_root });
-    const old_path = CURRENT_WORKSPACE?.db_path || '';
-
-    CURRENT_WORKSPACE = {
-      root_dir: resolved_root,
-      db_path: new_db.path
-    };
-
-    const changed = new_db.path !== old_path;
-
-    if (changed) {
-      log('workspace changed: %s → %s', old_path, new_db.path);
-
-      // Rebind the database watcher to the new workspace
-      if (DB_WATCHER) {
-        DB_WATCHER.rebind({ root_dir: resolved_root });
-      }
-
-      // Clear existing registry entries and refresh all subscriptions
-      registry.clear();
-      clearBoardListCache();
-
-      // Broadcast workspace-changed event to all clients
-      broadcast('workspace-changed', CURRENT_WORKSPACE);
-
-      // Schedule refresh of all active list subscriptions
-      scheduleListRefresh();
+    if (runtime_generation !== RUNTIME_GENERATION || CURRENT_WSS !== wss) {
+      return {
+        changed: false,
+        workspace: CURRENT_WORKSPACE || attached_workspace
+      };
     }
-
-    return { changed, workspace: CURRENT_WORKSPACE };
+    return applyWorkspaceChange(new_root_dir);
   }
 
   return {
     wss,
     broadcast,
-    scheduleListRefresh,
-    prewarmBoardCache: scheduleBoardListPrewarm,
+    scheduleListRefresh: () =>
+      runtime_generation === RUNTIME_GENERATION && CURRENT_WSS === wss
+        ? scheduleListRefresh()
+        : Promise.resolve(),
+    prewarmBoardCache: () =>
+      runtime_generation === RUNTIME_GENERATION && CURRENT_WSS === wss
+        ? scheduleBoardListPrewarm()
+        : Promise.resolve(),
     setWorkspace
     // v2: list subscription refresh handles updates
   };
@@ -942,7 +1409,22 @@ export async function handleMessage(ws, data) {
     }
     const client_id = validation.id;
     const spec = validation.spec;
+    const capabilities = validation.capabilities;
     const key = keyOf(spec);
+    const subscribe_intent = beginSubscribeIntent(ws, client_id);
+
+    if (subscribe_intent === null) {
+      ws.send(
+        JSON.stringify(
+          makeError(
+            req,
+            'resource_limit',
+            `A connection may reserve at most ${MAX_CONNECTION_SUBSCRIPTIONS} subscription ids`
+          )
+        )
+      );
+      return;
+    }
 
     /**
      * Reply with an error and avoid attaching the subscription when
@@ -956,57 +1438,169 @@ export async function handleMessage(ws, data) {
       ws.send(JSON.stringify(makeError(req, code, message, details)));
     };
 
-    /** @type {FetchListResult} */
-    let initial;
     try {
-      initial = await fetchInitialListForSubscription(client_id, spec);
-    } catch (err) {
-      log('subscribe-list snapshot error for %s: %o', key, err);
-      const message =
-        (err && /** @type {any} */ (err).message) || 'Failed to load list';
-      replyWithError('bd_error', String(message), { key });
-      return;
-    }
-
-    if (!initial.ok) {
-      log(
-        'initial snapshot failed for %s: %s %o',
-        key,
-        initial.error.message,
-        initial.error
-      );
-      const details = { ...(initial.error.details || {}), key };
-      replyWithError(initial.error.code, initial.error.message, details);
-      return;
-    }
-
-    const s = ensureSubs(ws);
-    const { key: attached_key } = registry.attach(spec, ws);
-    s.list_subs?.set(client_id, { key: attached_key, spec });
-
-    try {
-      await registry.withKeyLock(attached_key, async () => {
-        const items = applyClosedIssuesFilter(
-          spec,
-          initial ? initial.items : []
-        );
-        void registry.applyItems(attached_key, items);
-        emitSubscriptionSnapshot(ws, client_id, attached_key, items);
-      });
-    } catch (err) {
-      log('subscribe-list snapshot error for %s: %o', attached_key, err);
-      s.list_subs?.delete(client_id);
+      /** @type {FetchListResult} */
+      let initial;
+      const initial_generation = captureInitialSubscriptionGeneration();
       try {
-        registry.detach(spec, ws);
-      } catch {
-        // ignore detach errors
+        initial = await fetchInitialListForSubscription(client_id, spec);
+      } catch (err) {
+        log('subscribe-list snapshot error for %s: %o', key, err);
+        const message =
+          (err && /** @type {any} */ (err).message) || 'Failed to load list';
+        replyWithError('bd_error', String(message), { key });
+        return;
       }
-      replyWithError('bd_error', 'Failed to publish snapshot', { key });
-      return;
-    }
 
-    ws.send(JSON.stringify(makeOk(req, { id: client_id, key: attached_key })));
-    return;
+      if (
+        !isInitialSubscriptionIdentityCurrent(initial_generation) ||
+        !isSubscribeIntentCurrent(ws, client_id, subscribe_intent) ||
+        !isSocketOpen(ws)
+      ) {
+        if (isSocketOpen(ws)) {
+          replyWithError(
+            isInitialSubscriptionIdentityCurrent(initial_generation)
+              ? 'subscription_superseded'
+              : 'workspace_changed',
+            isInitialSubscriptionIdentityCurrent(initial_generation)
+              ? 'Subscription request was superseded'
+              : 'Workspace changed while loading the subscription; retry',
+            { key }
+          );
+        }
+        return;
+      }
+
+      if (!initial.ok) {
+        log(
+          'initial snapshot failed for %s: %s %o',
+          key,
+          initial.error.message,
+          initial.error
+        );
+        const details = { ...(initial.error.details || {}), key };
+        replyWithError(initial.error.code, initial.error.message, details);
+        return;
+      }
+
+      const s = ensureSubs(ws);
+      const items = applyClosedIssuesFilter(spec, initial.items);
+      const truncated = initial.truncated === true;
+      let stale = false;
+      let needs_refresh = false;
+
+      try {
+        await registry.withKeyLock(key, async () => {
+          if (
+            !isInitialSubscriptionIdentityCurrent(initial_generation) ||
+            !isSubscribeIntentCurrent(ws, client_id, subscribe_intent) ||
+            !isSocketOpen(ws)
+          ) {
+            stale = true;
+            return;
+          }
+
+          const previous = s.list_subs?.get(client_id) || null;
+          const previous_revision = currentListRevision(ws, key);
+          let previous_removed = false;
+
+          try {
+            const snapshot = prepareSubscriptionSnapshot(
+              ws,
+              client_id,
+              key,
+              items,
+              truncated
+            );
+            assertPushCapacity(ws, [snapshot]);
+
+            if (previous) {
+              previous_removed = detachClientSubscription(
+                ws,
+                client_id,
+                previous.intent
+              );
+            }
+
+            registry.attach(spec, ws);
+            s.list_subs?.set(client_id, {
+              key,
+              spec,
+              capabilities,
+              intent: subscribe_intent
+            });
+
+            const entry = registry.get(key);
+            if (entry && !entry.initialized) {
+              registry.applyItems(key, items);
+              entry.truncated = truncated;
+            } else {
+              needs_refresh = true;
+            }
+
+            ws.send(snapshot.encoded);
+          } catch (err) {
+            restoreListRevision(ws, key, previous_revision);
+            detachClientSubscription(ws, client_id, subscribe_intent);
+            if (previous && previous_removed) {
+              registry.attach(previous.spec, ws);
+              s.list_subs?.set(client_id, previous);
+            }
+            throw err;
+          }
+        });
+      } catch (err) {
+        log('subscribe-list snapshot error for %s: %o', key, err);
+        const error_code =
+          err && /** @type {any} */ (err).code === 'resource_limit'
+            ? 'resource_limit'
+            : 'bd_error';
+        const message =
+          error_code === 'resource_limit'
+            ? String(/** @type {any} */ (err).message)
+            : 'Failed to publish snapshot';
+        replyWithError(error_code, message, { key });
+        return;
+      }
+
+      if (stale) {
+        if (isSocketOpen(ws)) {
+          replyWithError(
+            isInitialSubscriptionIdentityCurrent(initial_generation)
+              ? 'subscription_superseded'
+              : 'workspace_changed',
+            isInitialSubscriptionIdentityCurrent(initial_generation)
+              ? 'Subscription request was superseded'
+              : 'Workspace changed while loading the subscription; retry',
+            { key }
+          );
+        }
+        return;
+      }
+
+      if (
+        needs_refresh ||
+        didRelevantInitialCacheGenerationChange(spec, initial_generation)
+      ) {
+        void scheduleListRefresh();
+      }
+
+      if (
+        BOARD_LIST_PREWARM_ENABLED &&
+        isBoardListSubscription(client_id, spec) &&
+        BOARD_SUBSCRIPTION_PREWARM_GENERATION !== BOARD_LIST_CACHE_GENERATION
+      ) {
+        BOARD_SUBSCRIPTION_PREWARM_GENERATION = BOARD_LIST_CACHE_GENERATION;
+        void scheduleBoardListPrewarm();
+      }
+
+      ws.send(
+        JSON.stringify(makeOk(req, { id: client_id, key, capabilities }))
+      );
+      return;
+    } finally {
+      finishSubscribeIntent(ws, client_id, subscribe_intent);
+    }
   }
 
   // unsubscribe-list: payload { id: string }
@@ -1022,16 +1616,9 @@ export async function handleMessage(ws, data) {
       return;
     }
     const s = ensureSubs(ws);
-    const sub = s.list_subs?.get(client_id) || null;
-    let removed = false;
-    if (sub) {
-      try {
-        removed = registry.detach(sub.spec, ws);
-      } catch {
-        removed = false;
-      }
-      s.list_subs?.delete(client_id);
-    }
+    nextSubscribeIntent(ws, client_id);
+    s.pending_subscriptions?.delete(client_id);
+    const removed = detachClientSubscription(ws, client_id);
     ws.send(
       JSON.stringify(
         makeOk(req, {
@@ -1664,45 +2251,16 @@ export async function handleMessage(ws, data) {
       return;
     }
 
-    // Resolve and validate the path
-    const resolved = path.resolve(workspace_path);
-
-    // Update workspace (this will rebind watcher, clear registry, broadcast change)
-    const new_db = resolveWorkspaceDatabase({ cwd: resolved });
-    const old_path = CURRENT_WORKSPACE?.db_path || '';
-
-    CURRENT_WORKSPACE = {
-      root_dir: resolved,
-      db_path: new_db.path
-    };
-
-    const changed = new_db.path !== old_path;
-
-    if (changed) {
-      log(
-        'workspace changed via set-workspace: %s → %s',
-        old_path,
-        new_db.path
-      );
-
-      // Rebind the database watcher
-      if (DB_WATCHER) {
-        DB_WATCHER.rebind({ root_dir: resolved });
-      }
-
-      // Clear existing registry entries
-      registry.clear();
-      clearBoardListCache();
-
-      // Schedule refresh of all active list subscriptions
-      scheduleListRefresh();
-    }
+    const result = applyWorkspaceChange(
+      workspace_path,
+      /** @type {WebSocket} */ (ws)
+    );
 
     ws.send(
       JSON.stringify(
         makeOk(req, {
-          changed,
-          workspace: CURRENT_WORKSPACE
+          changed: result.changed,
+          workspace: result.workspace
         })
       )
     );

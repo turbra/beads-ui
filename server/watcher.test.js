@@ -28,10 +28,16 @@ beforeEach(() => {
 describe('watchDb', () => {
   test('debounces rapid change events', () => {
     const calls = [];
-    const handle = watchDb('/repo', () => calls.push(null), {
-      debounce_ms: 100,
-      explicit_db: '/repo/.beads/ui.db'
-    });
+    const handle = watchDb(
+      '/repo',
+      () => {
+        calls.push(null);
+      },
+      {
+        debounce_ms: 100,
+        explicit_db: '/repo/.beads/ui.db'
+      }
+    );
     expect(watchers.length).toBe(1);
     const { cb } = watchers[0];
 
@@ -53,10 +59,16 @@ describe('watchDb', () => {
 
   test('ignores other filenames', () => {
     const calls = [];
-    const handle = watchDb('/repo', () => calls.push(null), {
-      debounce_ms: 50,
-      explicit_db: '/repo/.beads/ui.db'
-    });
+    const handle = watchDb(
+      '/repo',
+      () => {
+        calls.push(null);
+      },
+      {
+        debounce_ms: 50,
+        explicit_db: '/repo/.beads/ui.db'
+      }
+    );
     const { cb } = watchers[0];
     cb('change', 'something-else.db');
     vi.advanceTimersByTime(60);
@@ -66,10 +78,16 @@ describe('watchDb', () => {
 
   test('rebind attaches to new db path', () => {
     const calls = [];
-    const handle = watchDb('/repo', () => calls.push(null), {
-      debounce_ms: 50,
-      explicit_db: '/repo/.beads/ui.db'
-    });
+    const handle = watchDb(
+      '/repo',
+      () => {
+        calls.push(null);
+      },
+      {
+        debounce_ms: 50,
+        explicit_db: '/repo/.beads/ui.db'
+      }
+    );
     expect(watchers.length).toBe(1);
     const first = watchers[0];
 
@@ -93,28 +111,173 @@ describe('watchDb', () => {
     handle.close();
   });
 
-  test('ignores changes during cooldown window', () => {
+  test('coalesces cooldown changes into one trailing refresh', async () => {
     const calls = [];
-    const handle = watchDb('/repo', () => calls.push(null), {
-      debounce_ms: 10,
-      cooldown_ms: 100,
-      explicit_db: '/repo/.beads/ui.db'
-    });
+    const handle = watchDb(
+      '/repo',
+      () => {
+        calls.push(null);
+      },
+      {
+        debounce_ms: 10,
+        cooldown_ms: 100,
+        explicit_db: '/repo/.beads/ui.db'
+      }
+    );
     const { cb } = watchers[0];
 
     cb('change', 'ui.db');
-    vi.advanceTimersByTime(10);
+    await vi.advanceTimersByTimeAsync(10);
     expect(calls.length).toBe(1);
 
     cb('change', 'ui.db');
-    vi.advanceTimersByTime(10);
+    await vi.advanceTimersByTimeAsync(99);
     expect(calls.length).toBe(1);
 
-    vi.advanceTimersByTime(100);
-    cb('change', 'ui.db');
-    vi.advanceTimersByTime(10);
+    await vi.advanceTimersByTimeAsync(1);
     expect(calls.length).toBe(2);
 
+    cb('change', 'ui.db');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(calls.length).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(calls.length).toBe(3);
+
+    handle.close();
+  });
+
+  test('bounds callback-generated writes to one followup refresh', async () => {
+    const calls = [];
+    /** @type {((event: string, filename?: string) => void) | undefined} */
+    let callback;
+    const handle = watchDb(
+      '/repo',
+      () => {
+        calls.push(null);
+        callback?.('change', 'ui.db');
+      },
+      {
+        debounce_ms: 10,
+        cooldown_ms: 100,
+        explicit_db: '/repo/.beads/ui.db'
+      }
+    );
+    callback = watchers[0].cb;
+
+    callback('change', 'ui.db');
+    await vi.advanceTimersByTimeAsync(220);
+
+    expect(calls.length).toBe(3);
+    handle.close();
+  });
+
+  test('preserves an event during the trailing callback', async () => {
+    const calls = [];
+    /** @type {(() => void) | undefined} */
+    let resolve_trailing;
+    const handle = watchDb(
+      '/repo',
+      () => {
+        calls.push(null);
+        if (calls.length === 2) {
+          return new Promise((resolve) => {
+            resolve_trailing = resolve;
+          });
+        }
+      },
+      {
+        debounce_ms: 10,
+        cooldown_ms: 100,
+        explicit_db: '/repo/.beads/ui.db'
+      }
+    );
+    const callback = watchers[0].cb;
+
+    callback('change', 'ui.db');
+    await vi.advanceTimersByTimeAsync(10);
+    callback('change', 'ui.db');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(calls.length).toBe(2);
+
+    callback('change', 'ui.db');
+    resolve_trailing?.();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(110);
+
+    expect(calls.length).toBe(3);
+    handle.close();
+  });
+
+  test('starts a new burst for activity after the followup callback', async () => {
+    const calls = [];
+    /** @type {((event: string, filename?: string) => void) | undefined} */
+    let callback;
+    const handle = watchDb(
+      '/repo',
+      () => {
+        calls.push(null);
+        if (calls.length <= 3) {
+          callback?.('change', 'ui.db');
+        }
+      },
+      {
+        debounce_ms: 10,
+        cooldown_ms: 100,
+        explicit_db: '/repo/.beads/ui.db'
+      }
+    );
+    callback = watchers[0].cb;
+
+    callback('change', 'ui.db');
+    await vi.advanceTimersByTimeAsync(220);
+    expect(calls.length).toBe(3);
+
+    callback('change', 'ui.db');
+    await vi.advanceTimersByTimeAsync(110);
+    expect(calls.length).toBe(4);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(calls.length).toBe(4);
+    handle.close();
+  });
+
+  test('treats activity during the final callback as covered', async () => {
+    const calls = [];
+    /** @type {((event: string, filename?: string) => void) | undefined} */
+    let callback;
+    /** @type {(() => void) | undefined} */
+    let resolve_followup;
+    const handle = watchDb(
+      '/repo',
+      () => {
+        calls.push(null);
+        if (calls.length < 3) {
+          callback?.('change', 'ui.db');
+        }
+        if (calls.length === 3) {
+          return new Promise((resolve) => {
+            resolve_followup = resolve;
+          });
+        }
+      },
+      {
+        debounce_ms: 10,
+        cooldown_ms: 100,
+        explicit_db: '/repo/.beads/ui.db'
+      }
+    );
+    callback = watchers[0].cb;
+
+    callback('change', 'ui.db');
+    await vi.advanceTimersByTimeAsync(220);
+    expect(calls.length).toBe(3);
+
+    callback('change', 'ui.db');
+    resolve_followup?.();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(calls.length).toBe(3);
     handle.close();
   });
 });

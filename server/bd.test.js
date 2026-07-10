@@ -81,6 +81,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   for (const dir of temp_dirs.splice(0)) {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -295,6 +296,126 @@ describe('runBd', () => {
     const [res_failed, res_ok] = await Promise.all([failed, succeeded]);
     expect(res_failed.code).toBe(1);
     expect(res_ok.code).toBe(0);
+  });
+
+  test('times out with code 124 and waits for close before advancing queue', async () => {
+    vi.useFakeTimers();
+    const first = /** @type {any} */ (new EventEmitter());
+    first.stdout = new PassThrough();
+    first.stderr = new PassThrough();
+    first.kill = vi.fn(() => {
+      setTimeout(() => {
+        first.stdout.end();
+        first.stderr.end();
+        first.emit('close', null, 'SIGKILL');
+      }, 5);
+      return true;
+    });
+    first.stdout.write('partial');
+    const second = /** @type {any} */ (new EventEmitter());
+    second.stdout = new PassThrough();
+    second.stderr = new PassThrough();
+    second.kill = vi.fn();
+    mockedSpawn.mockReturnValueOnce(first).mockReturnValueOnce(second);
+
+    const timed_out = runBd(['list'], { timeout_ms: 10 });
+    const queued = runBd(['show', 'next']);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(first.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(mockedSpawn).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(5);
+    expect(mockedSpawn).toHaveBeenCalledTimes(2);
+    second.stdout.end('ok');
+    second.stderr.end();
+    second.emit('close', 0);
+    const [timeout_result, queued_result] = await Promise.all([
+      timed_out,
+      queued
+    ]);
+
+    expect(timeout_result).toEqual({
+      code: 124,
+      stdout: 'partial',
+      stderr: 'bd timed out after 10ms'
+    });
+    expect(queued_result.code).toBe(0);
+  });
+
+  test('prefers explicit timeout over the child environment', async () => {
+    vi.useFakeTimers();
+    const child = /** @type {any} */ (new EventEmitter());
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = vi.fn(() => {
+      child.emit('close', null, 'SIGKILL');
+      return true;
+    });
+    mockedSpawn.mockReturnValueOnce(child);
+
+    const result = runBd(['list'], {
+      timeout_ms: 12,
+      env: { BDUI_BD_TIMEOUT_MS: '7' }
+    });
+    await vi.advanceTimersByTimeAsync(7);
+    expect(child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5);
+
+    expect((await result).code).toBe(124);
+  });
+
+  test('uses the timeout from the child environment', async () => {
+    vi.useFakeTimers();
+    const child = /** @type {any} */ (new EventEmitter());
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = vi.fn(() => {
+      child.emit('close', null, 'SIGKILL');
+      return true;
+    });
+    mockedSpawn.mockReturnValueOnce(child);
+
+    const result = runBd(['list'], { env: { BDUI_BD_TIMEOUT_MS: '8' } });
+    await vi.advanceTimersByTimeAsync(8);
+
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    expect((await result).code).toBe(124);
+  });
+
+  test('falls back to 30 seconds for an invalid explicit timeout', async () => {
+    vi.useFakeTimers();
+    const child = /** @type {any} */ (new EventEmitter());
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = vi.fn(() => {
+      child.emit('close', null, 'SIGKILL');
+      return true;
+    });
+    mockedSpawn.mockReturnValueOnce(child);
+
+    const result = runBd(['list'], {
+      timeout_ms: -1,
+      env: { BDUI_BD_TIMEOUT_MS: '8' }
+    });
+    await vi.advanceTimersByTimeAsync(29999);
+    expect(child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect((await result).stderr).toContain('30000ms');
+  });
+
+  test('uses a non-zero exit for signal termination without timeout', async () => {
+    const child = /** @type {any} */ (new EventEmitter());
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = vi.fn();
+    mockedSpawn.mockReturnValueOnce(child);
+
+    const result = runBd(['list'], { timeout_ms: 0 });
+    child.emit('close', null, 'SIGTERM');
+
+    expect((await result).code).toBe(1);
   });
 });
 

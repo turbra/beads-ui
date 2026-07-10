@@ -11,25 +11,46 @@ import { showToast } from '../utils/toast.js';
 import { createTypeBadge } from '../utils/type-badge.js';
 
 /**
- * Format a date string for display.
- *
- * @param {string} [dateStr]
- * @returns {string}
+ * @typedef {Object} CommentTime
+ * @property {string} datetime
+ * @property {string} display
+ * @property {string} title
+ * @property {boolean} valid
  */
-function formatCommentDate(dateStr) {
-  if (!dateStr) return '';
-  try {
-    const date = new Date(dateStr);
-    return date.toLocaleDateString(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    });
-  } catch {
-    return dateStr;
+
+/**
+ * Format a comment timestamp for compact display and accessible metadata.
+ *
+ * @param {string} [date_str]
+ * @returns {CommentTime}
+ */
+function formatCommentTime(date_str) {
+  const fallback = String(date_str || '');
+  const date = new Date(fallback);
+  const timestamp = date.getTime();
+  if (!fallback || Number.isNaN(timestamp)) {
+    return { datetime: '', display: fallback, title: fallback, valid: false };
   }
+
+  const elapsed_seconds = Math.max(
+    0,
+    Math.floor((Date.now() - timestamp) / 1000)
+  );
+  let display = 'just now';
+  if (elapsed_seconds >= 86400) {
+    display = `${Math.floor(elapsed_seconds / 86400)}d`;
+  } else if (elapsed_seconds >= 3600) {
+    display = `${Math.floor(elapsed_seconds / 3600)}h`;
+  } else if (elapsed_seconds >= 60) {
+    display = `${Math.floor(elapsed_seconds / 60)}m`;
+  }
+
+  return {
+    datetime: date.toISOString(),
+    display,
+    title: date.toLocaleString(),
+    valid: true
+  };
 }
 
 /**
@@ -123,59 +144,91 @@ export function createDetailView(
 
   /** @type {HTMLDialogElement | null} */
   let delete_dialog = null;
+  /** @type {string | null} */
+  let delete_target_id = null;
+
+  function closeDeleteDialog() {
+    if (!delete_dialog) {
+      return;
+    }
+    if (typeof delete_dialog.close === 'function') {
+      delete_dialog.close();
+    }
+    delete_dialog.removeAttribute('open');
+  }
+
+  /**
+   * @param {Event} ev
+   */
+  function onDeleteDialogCancel(ev) {
+    ev.preventDefault();
+    closeDeleteDialog();
+  }
+
+  async function onDeleteConfirm() {
+    const id = delete_target_id;
+    closeDeleteDialog();
+    if (id) {
+      await performDelete(id);
+    }
+  }
 
   function ensureDeleteDialog() {
-    if (delete_dialog) return delete_dialog;
+    if (delete_dialog) {
+      return delete_dialog;
+    }
     delete_dialog = document.createElement('dialog');
     delete_dialog.id = 'delete-confirm-dialog';
     delete_dialog.setAttribute('role', 'alertdialog');
     delete_dialog.setAttribute('aria-modal', 'true');
+    delete_dialog.setAttribute('aria-labelledby', 'delete-confirm-title');
+    delete_dialog.setAttribute('aria-describedby', 'delete-confirm-message');
+    delete_dialog.addEventListener('cancel', onDeleteDialogCancel);
     document.body.appendChild(delete_dialog);
     return delete_dialog;
   }
 
   function openDeleteDialog() {
-    if (!current) return;
+    if (!current) {
+      return;
+    }
     const dialog = ensureDeleteDialog();
-    const issueId = current.id;
-    const issueTitle = current.title || '(no title)';
-    dialog.innerHTML = `
-      <div class="delete-confirm">
-        <h2 class="delete-confirm__title">Delete Issue</h2>
-        <p class="delete-confirm__message">
-          Are you sure you want to delete issue <strong>${issueId}</strong> — <strong>${issueTitle}</strong>? This action cannot be undone.
-        </p>
-        <div class="delete-confirm__actions">
-          <button type="button" class="btn" id="delete-cancel-btn">Cancel</button>
-          <button type="button" class="btn danger" id="delete-confirm-btn">Delete</button>
+    const issue_id = current.id;
+    const issue_title = current.title || '(no title)';
+    delete_target_id = issue_id;
+    render(
+      html`
+        <div class="delete-confirm">
+          <h2 class="delete-confirm__title" id="delete-confirm-title">
+            Delete Issue
+          </h2>
+          <p class="delete-confirm__message" id="delete-confirm-message">
+            Are you sure you want to delete issue
+            <strong>${issue_id}</strong> — <strong>${issue_title}</strong>? This
+            action cannot be undone.
+          </p>
+          <div class="delete-confirm__actions">
+            <button
+              type="button"
+              class="btn"
+              id="delete-cancel-btn"
+              @click=${closeDeleteDialog}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              class="btn danger"
+              id="delete-confirm-btn"
+              @click=${onDeleteConfirm}
+            >
+              Delete
+            </button>
+          </div>
         </div>
-      </div>
-    `;
-    const cancelBtn = dialog.querySelector('#delete-cancel-btn');
-    const confirmBtn = dialog.querySelector('#delete-confirm-btn');
-
-    cancelBtn?.addEventListener('click', () => {
-      if (typeof dialog.close === 'function') {
-        dialog.close();
-      }
-      dialog.removeAttribute('open');
-    });
-
-    confirmBtn?.addEventListener('click', async () => {
-      if (typeof dialog.close === 'function') {
-        dialog.close();
-      }
-      dialog.removeAttribute('open');
-      await performDelete();
-    });
-
-    dialog.addEventListener('cancel', (ev) => {
-      ev.preventDefault();
-      if (typeof dialog.close === 'function') {
-        dialog.close();
-      }
-      dialog.removeAttribute('open');
-    });
+      `,
+      dialog
+    );
 
     if (typeof dialog.showModal === 'function') {
       try {
@@ -187,19 +240,26 @@ export function createDetailView(
     } else {
       dialog.setAttribute('open', '');
     }
+    const cancel_button = /** @type {HTMLButtonElement | null} */ (
+      dialog.querySelector('#delete-cancel-btn')
+    );
+    cancel_button?.focus();
   }
 
-  async function performDelete() {
-    if (!current) return;
-    const id = current.id;
+  /**
+   * @param {string} id
+   */
+  async function performDelete(id) {
     try {
       await sendFn('delete-issue', { id });
-      current = null;
-      current_id = null;
-      doRender();
-      // Navigate back to close the dialog
-      const view = parseView(window.location.hash || '');
-      navigateFn(`#/${view}`);
+      if (current?.id === id) {
+        current = null;
+        current_id = null;
+        doRender();
+        // Navigate back to close the dialog
+        const view = parseView(window.location.hash || '');
+        navigateFn(`#/${view}`);
+      }
     } catch (err) {
       log('delete failed: %o', err);
       showToast('Failed to delete issue', 'error');
@@ -1330,19 +1390,27 @@ export function createDetailView(
           ? html`<div class="muted">
               ${comments_pending ? 'Loading comments…' : 'No comments yet'}
             </div>`
-          : comments.map(
-              (c) => html`
+          : comments.map((c) => {
+              const comment_time = formatCommentTime(c.created_at);
+              return html`
                 <div class="comment-item">
                   <div class="comment-header">
                     <span class="comment-author">${c.author || 'Unknown'}</span>
-                    <span class="comment-date"
-                      >${formatCommentDate(c.created_at)}</span
-                    >
+                    ${comment_time.valid
+                      ? html`<time
+                          class="comment-date"
+                          datetime=${comment_time.datetime}
+                          title=${comment_time.title}
+                          >${comment_time.display}</time
+                        >`
+                      : html`<span class="comment-date"
+                          >${comment_time.display}</span
+                        >`}
                   </div>
-                  <div class="comment-text">${c.text}</div>
+                  <div class="comment-text md">${renderMarkdown(c.text)}</div>
                 </div>
-              `
-            )}
+              `;
+            })}
       <div class="comment-input">
         <textarea
           placeholder="Add a comment... (Ctrl+Enter to submit)"
@@ -1674,8 +1742,10 @@ export function createDetailView(
         unsubscribe_issue_stores = null;
       }
       if (delete_dialog && delete_dialog.parentNode) {
+        delete_dialog.removeEventListener('cancel', onDeleteDialogCancel);
         delete_dialog.parentNode.removeChild(delete_dialog);
         delete_dialog = null;
+        delete_target_id = null;
       }
     }
   };

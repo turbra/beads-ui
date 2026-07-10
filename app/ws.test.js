@@ -139,6 +139,69 @@ describe('app/ws client', () => {
     client.close();
   });
 
+  test('rejects queued requests from a failed socket attempt', async () => {
+    vi.useFakeTimers();
+    const sockets = setupFakeWebSocket();
+    const client = createWsClient({
+      backoff: { initialMs: 10, maxMs: 10, jitterRatio: 0 }
+    });
+    const request = client.send('list-issues', { filters: {} });
+
+    sockets[0].close();
+
+    await expect(request).rejects.toMatchObject({
+      code: 'ws_disconnected',
+      message: 'ws disconnected'
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    sockets[1].openNow();
+    expect(sockets[1].sent).toEqual([]);
+
+    client.close();
+    vi.useRealTimers();
+  });
+
+  test('sends requests queued after disconnect on the next socket', async () => {
+    vi.useFakeTimers();
+    const sockets = setupFakeWebSocket();
+    const client = createWsClient({
+      backoff: { initialMs: 10, maxMs: 10, jitterRatio: 0 }
+    });
+    sockets[0].openNow();
+    sockets[0].close();
+
+    const request = client.send('list-issues', { filters: {} });
+    await vi.advanceTimersByTimeAsync(10);
+    sockets[1].openNow();
+    const frame = JSON.parse(sockets[1].sent[0]);
+    sockets[1].emitMessage({
+      id: frame.id,
+      ok: true,
+      type: 'list-issues',
+      payload: [{ id: 'UI-2' }]
+    });
+
+    await expect(request).resolves.toEqual([{ id: 'UI-2' }]);
+
+    client.close();
+    vi.useRealTimers();
+  });
+
+  test('rejects sends after terminal close', async () => {
+    const sockets = setupFakeWebSocket();
+    const client = createWsClient();
+    sockets[0].openNow();
+
+    client.close();
+
+    await expect(
+      client.send('list-issues', { filters: {} })
+    ).rejects.toMatchObject({
+      code: 'ws_client_closed',
+      message: 'ws client closed'
+    });
+  });
+
   test('dispatches server events', async () => {
     const sockets = setupFakeWebSocket();
     const client = createWsClient();

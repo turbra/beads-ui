@@ -1147,6 +1147,37 @@ input.inline-edit:focus {
   overflow: hidden;
   background: var(--bg);
 }
+.list-empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  min-height: 96px;
+  padding: var(--space-6);
+}
+.list-boundary-notice {
+  margin: 0 var(--space-6) var(--space-3);
+  color: var(--muted);
+  font-size: 12px;
+}
+.sort-header {
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.sort-header:hover {
+  color: var(--link);
+  background: transparent;
+}
+.updated-col {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
 .epic-header {
   display: flex;
   align-items: center;

@@ -100,7 +100,7 @@ describe('ws board cache', () => {
 
     await prewarmBoardCache();
 
-    expect(mock).toHaveBeenCalledTimes(4);
+    expect(mock).toHaveBeenCalledTimes(3);
     mock.mockClear();
 
     const sock = createSocket();
@@ -183,12 +183,69 @@ describe('ws board cache', () => {
     await subscribeList(sock, 'tab:board:in-progress', 'in-progress-issues');
     await subscribeList(sock, 'tab:board:closed', 'closed-issues', { since });
 
-    expect(mock).not.toHaveBeenCalled();
+    expect(mock).toHaveBeenCalledTimes(1);
+    expect(mock).toHaveBeenCalledWith(
+      { type: 'closed-issues', params: { since } },
+      expect.any(Object)
+    );
+    mock.mockClear();
 
     scheduleListRefresh();
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(mock).toHaveBeenCalledTimes(4);
+    wss.close();
+  });
+
+  test('fetches each active closed range instead of prewarming today', async () => {
+    const server = createServer();
+    const { prewarmBoardCache, wss } = attachWsServer(server, { path: '/ws' });
+    const mock = resetAdapterMock();
+    await prewarmBoardCache();
+    expect(mock).toHaveBeenCalledTimes(3);
+    mock.mockClear();
+    const now = Date.now();
+    const three_days = now - 3 * 24 * 60 * 60 * 1000;
+    const seven_days = now - 7 * 24 * 60 * 60 * 1000;
+
+    await subscribeList(createSocket(), 'tab:board:closed', 'closed-issues', {
+      since: three_days
+    });
+    await subscribeList(createSocket(), 'tab:board:closed', 'closed-issues', {
+      since: seven_days
+    });
+
+    expect(mock).toHaveBeenCalledTimes(2);
+    expect(mock.mock.calls.map(([spec]) => spec)).toEqual([
+      { type: 'closed-issues', params: { since: three_days } },
+      { type: 'closed-issues', params: { since: seven_days } }
+    ]);
+    wss.close();
+  });
+
+  test('does not prewarm board lanes after a non-board refresh', async () => {
+    const server = createServer();
+    const { scheduleListRefresh, wss } = attachWsServer(server, {
+      path: '/ws',
+      prewarm_board_cache: true,
+      refresh_debounce_ms: 0
+    });
+    const mock = resetAdapterMock();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mock.mockClear();
+
+    const sock = createSocket();
+    wss.clients.add(/** @type {any} */ (sock));
+    await subscribeList(sock, 'tab:issues', 'all-issues');
+    mock.mockClear();
+
+    await scheduleListRefresh();
+
+    expect(mock).toHaveBeenCalledTimes(1);
+    expect(mock).toHaveBeenCalledWith(
+      { type: 'all-issues', params: undefined },
+      expect.objectContaining({ priority: 'background' })
+    );
     wss.close();
   });
 });

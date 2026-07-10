@@ -48,10 +48,9 @@ vi.mock('./ws.js', () => {
  * Flush pending subscription and render microtasks.
  */
 async function flushPromises() {
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let index = 0; index < 8; index += 1) {
+    await Promise.resolve();
+  }
 }
 
 describe('main performance-sensitive subscriptions', () => {
@@ -105,6 +104,40 @@ describe('main performance-sensitive subscriptions', () => {
     expect(Number(next_closed_subs[1].payload.params.since)).toBeLessThan(
       first_since
     );
+  });
+
+  test('refreshes the board closed subscription after local midnight', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 6, 10, 23, 59, 59, 900));
+    try {
+      window.location.hash = '#/board';
+      document.body.innerHTML = '<main id="app"></main>';
+      const root = /** @type {HTMLElement} */ (document.getElementById('app'));
+
+      bootstrap(root);
+      await flushPromises();
+      const initial = calls.filter(
+        (call) =>
+          call.type === 'subscribe-list' &&
+          call.payload?.id === 'tab:board:closed'
+      );
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await flushPromises();
+
+      const refreshed = calls.filter(
+        (call) =>
+          call.type === 'subscribe-list' &&
+          call.payload?.id === 'tab:board:closed'
+      );
+      expect(initial).toHaveLength(1);
+      expect(refreshed).toHaveLength(2);
+      expect(refreshed[1].payload.params.since).toBeGreaterThan(
+        refreshed[0].payload.params.since
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test('does not resubscribe detail for unrelated state changes', async () => {
