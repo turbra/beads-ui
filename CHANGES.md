@@ -1,5 +1,53 @@
 # Changes
 
+## Unreleased
+
+### Fixes
+
+- Restore live subscriptions after WebSocket reconnects without replaying
+  requests from a failed connection.
+- Coalesce trailing database watcher events so burst writes do not leave the UI
+  stale.
+- Apply a default timeout to `bd` commands so one hung process cannot block all
+  lists, details, and mutations indefinitely.
+- Apply list-row edits optimistically, roll them back on failure, and show an
+  actionable error instead of silently discarding the change.
+- Persist multi-select status and issue-type filters across reloads and keep the
+  server-computed Ready filter mutually exclusive.
+- Restore the saved workspace before creating initial subscriptions and refresh
+  the Board's Closed today window at midnight or when the page becomes visible.
+- Prevent stale workspace, cache, and subscription results from being published
+  after lifecycle changes.
+
+### Enhancements
+
+- Expand issue search to include IDs, titles, assignees, and labels.
+- Add sortable Priority and Updated columns to the Issues and Epics tables.
+- Improve empty states with Create Issue and Clear Filters actions.
+- Render comments as sanitized Markdown with readable relative timestamps.
+- Improve keyboard editing focus and add accessible names, selection state, and
+  sorting metadata to issue tables.
+
+### Performance
+
+- Coalesce subscription-store notifications and defer sorting so synchronous
+  update bursts trigger one sort and render cycle.
+- Debounce issue search, key issue rows by ID, and avoid redundant persisted
+  state writes.
+- Coalesce list refresh bursts and reuse generation-safe Board and detail cache
+  results.
+- Add capability-gated atomic server delta delivery while preserving legacy
+  snapshot, upsert, and delete compatibility.
+- Bound list snapshots to 1,000 issues with exact truncation metadata, connection
+  quotas, and WebSocket frame and buffer limits.
+
+### Security
+
+- Remove the raw-HTML issue title sink and accumulated event listeners from the
+  delete confirmation dialog.
+- Strictly validate subscription IDs, capabilities, types, and parameters, and
+  reject client-controlled result limits.
+
 ## 0.12.0
 
 - [`8559d4a`](https://github.com/mantoni/beads-ui/commit/8559d4af699555b9943914a2e790965c9e4d8da7)
