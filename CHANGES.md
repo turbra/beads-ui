@@ -18,24 +18,37 @@
   the Board's Closed today window at midnight or when the page becomes visible.
 - Prevent stale workspace, cache, and subscription results from being published
   after lifecycle changes.
+- Run detail, comment, dependency, label, delete, and mutation commands against
+  the currently selected workspace instead of the daemon's startup directory.
 
 ### Enhancements
 
+- Refresh the interface with an OpenShift-style masthead, surfaces, controls,
+  badges, focus states, and coordinated light and dark color palettes.
+- Open issue details immediately from active list or Board data while the full
+  detail and comments load in the background, with an inline retry when comments
+  fail.
+- Add Today, 3 days, and 7 days filters to the Board's Closed column.
 - Expand issue search to include IDs, titles, assignees, and labels.
 - Add sortable Priority and Updated columns to the Issues and Epics tables.
 - Improve empty states with Create Issue and Clear Filters actions.
 - Render comments as sanitized Markdown with readable relative timestamps.
 - Improve keyboard editing focus and add accessible names, selection state, and
   sorting metadata to issue tables.
+- Print the reusable server URL after `bdui start` or `bdui restart` connects to
+  an already running server.
 
 ### Performance
 
 - Coalesce subscription-store notifications and defer sorting so synchronous
   update bursts trigger one sort and render cycle.
-- Debounce issue search, key issue rows by ID, and avoid redundant persisted
-  state writes.
-- Coalesce list refresh bursts and reuse generation-safe Board and detail cache
-  results.
+- Scope store notifications to the affected view, debounce issue search, key
+  issue rows and Board cards by ID, and avoid redundant persisted state writes.
+- Prewarm Board lists, reuse in-flight and refresh results, and keep bounded,
+  generation-safe detail, comment, and sanitized Markdown caches.
+- Prioritize interactive detail and mutation commands in the serialized `bd`
+  queue while retaining bounded service for background refreshes.
+- Coalesce list refresh bursts and mutation-triggered refresh work.
 - Add capability-gated atomic server delta delivery while preserving legacy
   snapshot, upsert, and delete compatibility.
 - Bound list snapshots to 1,000 issues with exact truncation metadata, connection
