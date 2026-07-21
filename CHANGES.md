@@ -28,11 +28,14 @@
   readiness rather than lifecycle status, show blocking issue IDs, and prevent
   status-only drops from pretending to change dependency state.
 - Show children and dependents in issue and epic details by requesting complete
-  relationship data from `bd`.
+  relationship data from `bd`
+  ([upstream PR #94](https://github.com/mantoni/beads-ui/pull/94)).
 - Persist comments with configured Git author attribution by using the supported
-  `bd comments add` command.
+  `bd comments add` command
+  ([upstream PR #97](https://github.com/mantoni/beads-ui/pull/97)).
 - Log failed mutation and other non-JSON `bd` commands with command context and
-  accurate timeout exit codes.
+  accurate timeout exit codes
+  ([upstream PR #88](https://github.com/mantoni/beads-ui/pull/88)).
 
 ### Enhancements
 
