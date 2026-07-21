@@ -24,6 +24,15 @@
   silently accepting later updates on stale state.
 - Replace blocking subscription-failure dialogs with scoped, retryable alerts
   that preserve successfully loaded Issues, Epics, detail, and Board content.
+- Clarify that the Board's Blocked and Ready lanes represent dependency
+  readiness rather than lifecycle status, show blocking issue IDs, and prevent
+  status-only drops from pretending to change dependency state.
+- Show children and dependents in issue and epic details by requesting complete
+  relationship data from `bd`.
+- Persist comments with configured Git author attribution by using the supported
+  `bd comments add` command.
+- Log failed mutation and other non-JSON `bd` commands with command context and
+  accurate timeout exit codes.
 
 ### Enhancements
 
@@ -36,6 +45,9 @@
 - Expand issue search to include IDs, titles, assignees, and labels.
 - Add stable, accessible sorting to every Issues column and to Priority and
   Updated in the Epics table.
+- Let users resize every Issues and Epics child-table column with visible
+  pointer and keyboard controls, preserve widths independently, and scroll
+  horizontally for wide layouts.
 - Improve empty states with Create Issue and Clear Filters actions.
 - Render comments as sanitized Markdown with readable relative timestamps.
 - Improve keyboard editing focus and add accessible names, selection state, and
