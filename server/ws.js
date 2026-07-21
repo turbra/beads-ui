@@ -2206,7 +2206,7 @@ export async function handleMessage(ws, data) {
 
     // Get git user name for author attribution
     const author = await getGitUserName(bd_options);
-    const args = ['comment', id, text.trim()];
+    const args = ['comments', 'add', id, text.trim()];
     if (author) {
       args.push('--author', author);
     }

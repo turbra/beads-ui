@@ -536,7 +536,7 @@ describe('ws mutation handlers', () => {
 
     expect(mGit).toHaveBeenCalledWith({ cwd: root_dir });
     expect(mRun).toHaveBeenLastCalledWith(
-      ['comment', 'UI-9', 'hello', '--author', 'Alice'],
+      ['comments', 'add', 'UI-9', 'hello', '--author', 'Alice'],
       { cwd: root_dir }
     );
     expect(mJson).toHaveBeenLastCalledWith(['comments', 'UI-9', '--json'], {

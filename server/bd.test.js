@@ -160,6 +160,40 @@ describe('runBd', () => {
     expect(res.stderr).toContain('boom');
   });
 
+  test('logs non-zero exits with args and stderr', async () => {
+    const debug_mod = await import('debug');
+    const previous_debug = process.env.DEBUG;
+    debug_mod.default.enable('beads-ui:bd');
+    /** @type {string[]} */
+    const captured = [];
+    const stderr_spy = vi.spyOn(process.stderr, 'write').mockImplementation(
+      /** @param {any} chunk */ (chunk) => {
+        captured.push(String(chunk));
+        return true;
+      }
+    );
+
+    try {
+      mockedSpawn.mockReturnValueOnce(makeFakeProc('', 'boom', 2));
+
+      const result = await runBd(['update', 'UI-7', '--status', 'closed']);
+
+      expect(result.code).toBe(2);
+      const output = captured.join('');
+      expect(output).toMatch(/beads-ui:bd/);
+      expect(output).toMatch(/code 2/);
+      expect(output).toMatch(/update/);
+      expect(output).toMatch(/boom/);
+    } finally {
+      stderr_spy.mockRestore();
+      if (previous_debug === undefined) {
+        debug_mod.default.disable();
+      } else {
+        debug_mod.default.enable(previous_debug);
+      }
+    }
+  });
+
   test('sets BEADS_DB for workspace-local SQLite db', async () => {
     const root = make_temp_dir();
     const beads_dir = path.join(root, '.beads');

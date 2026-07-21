@@ -205,12 +205,22 @@ function runBdUnlocked(args, options = {}) {
       }
       const stderr = err_chunks.join('');
       const timeout_message = `bd timed out after ${timeout_ms}ms`;
+      const exit_code = timed_out ? 124 : typeof code === 'number' ? code : 1;
+      const result_stderr = timed_out
+        ? `${stderr}${stderr.endsWith('\n') || stderr.length === 0 ? '' : '\n'}${timeout_message}`
+        : stderr;
+      if (exit_code !== 0) {
+        log(
+          'bd exited with code %d (args=%o) stderr=%s',
+          exit_code,
+          final_args,
+          result_stderr
+        );
+      }
       resolve({
-        code: timed_out ? 124 : typeof code === 'number' ? code : 1,
+        code: exit_code,
         stdout: out_chunks.join(''),
-        stderr: timed_out
-          ? `${stderr}${stderr.endsWith('\n') || stderr.length === 0 ? '' : '\n'}${timeout_message}`
-          : stderr
+        stderr: result_stderr
       });
     };
 
@@ -349,12 +359,6 @@ function nextBdQueueTask() {
 export async function runBdJson(args, options = {}) {
   const result = await runBd(args, options);
   if (result.code !== 0) {
-    log(
-      'bd exited with code %d (args=%o) stderr=%s',
-      result.code,
-      args,
-      result.stderr
-    );
     return { code: result.code, stderr: result.stderr };
   }
   /** @type {unknown} */

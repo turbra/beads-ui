@@ -156,7 +156,7 @@ describe('add-comment handler', () => {
     // Verify bd was called with correct args including --author
     expect(gitUser).toHaveBeenCalledWith({ cwd: undefined });
     expect(rb).toHaveBeenCalledWith(
-      ['comment', 'UI-1', 'New comment', '--author', 'Test User'],
+      ['comments', 'add', 'UI-1', 'New comment', '--author', 'Test User'],
       { cwd: undefined }
     );
   });
@@ -191,9 +191,10 @@ describe('add-comment handler', () => {
 
     // Verify bd was called without --author
     expect(gitUser).toHaveBeenCalledWith({ cwd: undefined });
-    expect(rb).toHaveBeenCalledWith(['comment', 'UI-1', 'Anonymous comment'], {
-      cwd: undefined
-    });
+    expect(rb).toHaveBeenCalledWith(
+      ['comments', 'add', 'UI-1', 'Anonymous comment'],
+      { cwd: undefined }
+    );
   });
 
   test('returns error when text is empty', async () => {
